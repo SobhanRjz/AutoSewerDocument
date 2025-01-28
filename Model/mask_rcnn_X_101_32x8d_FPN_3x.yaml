@@ -277,7 +277,7 @@ MODEL:
     NAME: SemSegFPNHead
     NORM: GN
     NUM_CLASSES: 54
-  WEIGHTS: /content/DL_Detectron2/output/model_final.pth
+  WEIGHTS: C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\model_final.pth
 OUTPUT_DIR: /content/DL_Detectron2/output
 SEED: 42
 SOLVER:

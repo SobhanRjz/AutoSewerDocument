@@ -180,3 +180,5 @@ events.out.tfevents*
 *.config
 *.last_checkpoint
 last_checkpoint
+*.xlsx
+output/model.onnx
