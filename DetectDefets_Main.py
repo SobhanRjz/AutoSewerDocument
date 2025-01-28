@@ -6,7 +6,7 @@ import detectron2
 from detectron2.utils.logger import setup_logger
 from detectron2.engine import DefaultPredictor
 from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer
+from detectron2.utils.visualizer import Visualizer, ColorMode
 from detectron2.data import MetadataCatalog
 import cv2
 import time
@@ -21,7 +21,7 @@ class DetectionConfig:
     class_names: List[str] = None
     colors: List[List[int]] = None
     score_threshold: float = 0.7
-    nms_threshold: float = 0.7
+    nms_threshold: float = 0.2
     model_path: str = None
     config_path: str = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -46,6 +46,7 @@ class DefectDetector:
         
         # Create predictor
         self.predictor = DefaultPredictor(self.cfg)
+
         torch.backends.cudnn.benchmark = True
         
         # Initialize detections list
@@ -132,11 +133,19 @@ class DefectDetector:
             (width, height)
         )
 
+    def format_timestamp(self, seconds: float) -> str:
+        """Convert seconds to HH:MM:SS format"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    
     def _process_frames(self, cap: cv2.VideoCapture, writer: cv2.VideoWriter, frame_interval: int, frames_dir: str) -> None:
         """Process individual frames from the video"""
         frame_count = 0
+        countPic = 0
         fps = int(cap.get(cv2.CAP_PROP_FPS))
-        frames_to_save = []
+        output_frames = []  # Store frames with detections
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -144,6 +153,7 @@ class DefectDetector:
                 break
 
             if frame_count % frame_interval == 0:
+                countPic += 1
                 # Calculate timestamp in seconds
                 timestamp = frame_count / fps
                 
@@ -152,10 +162,10 @@ class DefectDetector:
                 
                 # Store frame info if defects were detected
                 if has_detections:
-                    frames_to_save.append({
+                    output_frames.append({
                         'frame': output_frame,
-                        'count': frame_count,
-                        'timestamp': timestamp
+                        'timestamp': timestamp,
+                        'count': countPic
                     })
                 
                 # Display frame
@@ -169,10 +179,18 @@ class DefectDetector:
             frame_count += 1
 
         # Save all frames with detections after processing
-        for frame_info in frames_to_save:
-            frame_path = os.path.join(frames_dir, f"frame_{frame_info['count']:06d}_{frame_info['timestamp']:.2f}s.jpg")
-            cv2.imwrite(frame_path, frame_info['frame'])
-            self.logger.info(f"Saved frame with detections: {frame_path}")
+        for frame_info in output_frames:
+            timestamp_str = self.format_timestamp(frame_info['timestamp']).replace(':', '_')
+            frame_path = os.path.join(frames_dir, f"frame_{frame_info['count']}_{timestamp_str}.jpg")
+            
+            try:
+                success = cv2.imwrite(frame_path, frame_info['frame'])
+                if success:
+                    self.logger.info(f"Saved frame with detections: {frame_path}")
+                else:
+                    self.logger.error(f"Failed to save frame: {frame_path}")
+            except Exception as e:
+                self.logger.error(f"Error saving frame {frame_path}: {str(e)}")
 
     def _process_single_frame(self, frame: np.ndarray, timestamp: float) -> tuple[np.ndarray, bool]:
         """Process a single frame and return the annotated result and detection data"""
@@ -206,7 +224,7 @@ class DefectDetector:
         self.all_detections.extend(detection_data)
         
         # Visualize results
-        v = Visualizer(frame[:, :, ::-1], metadata=self.metadata, scale=1.2)
+        v = Visualizer(frame[:, :, ::-1], metadata=self.metadata, scale=1.0, instance_mode= ColorMode.SEGMENTATION) # Dim input image to highlight predictions)
         v = v.draw_instance_predictions(instances)
         
         return v.get_image()[:, :, ::-1], len(detection_data) > 0
@@ -217,8 +235,8 @@ def main():
         class_names=[
             "Crack",           # Red for cracks/structural damage
             "Obstacle",        # Green for physical blockages 
-            "Deposit",         # Blue for sediment/debris
-            "Deform",          # Yellow for pipe deformation
+            "Deposits",         # Blue for sediment/debris
+            "Deformed",          # Yellow for pipe deformation
             "Broken",          # Magenta for severe breaks
             "Joint Displaced", # Cyan for joint issues
             "Surface Damage",  # Gray for surface deterioration
@@ -234,8 +252,8 @@ def main():
             [128, 128, 128],  # Gray - Surface Damage
             [128, 0, 128]     # Purple - Root
         ],
-        model_path=os.path.join(r"C:\Users\sobha\Desktop\detectron2\Sobhan\TheisisSobhan\bin\Debug", "model_final.pth"),
-        config_path=os.path.join(r"C:\Users\sobha\Desktop\detectron2\Sobhan\TheisisSobhan\bin\Debug", "mask_rcnn_X_101_32x8d_FPN_3x.yaml")
+        model_path=os.path.join(r"Model", "model_final.pth"),
+        config_path=os.path.join(r"Model", "mask_rcnn_X_101_32x8d_FPN_3x.yaml")
     )
 
     # Initialize detector
@@ -243,7 +261,7 @@ def main():
 
     # Process video
     input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
-    output_path = os.path.join(os.getcwd(), os.path.splitext(os.path.basename(input_path))[0] + "_output.mp4")
+    output_path = os.path.join("output", os.path.basename(input_path))
     
     detector.logger.info(f"Processing video: {input_path}")
     detector.process_video(input_path, output_path)
