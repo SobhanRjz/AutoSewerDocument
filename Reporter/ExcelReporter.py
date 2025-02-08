@@ -82,7 +82,7 @@ class ExcelReporter:
                     if header == "زمان بر روی ویدئو":
                         value = self.format_timestamp(float(entry["Detection"][key]))
                     elif header == "فاصله از نقطه شروع":
-                        value = entry.get(key, [""])[0] if entry.get(key) else ""
+                        value = entry.get(key, [])
                     elif header == "کد عیوب":
                         raw_value = entry[key[0]][key[1]]
                         value = self.DefectsCodeDict.get(raw_value, raw_value)
@@ -151,7 +151,7 @@ class ExcelReporter:
     def generate_report(self) -> None:
         """Generate the Excel report"""
         #detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\Closed circuit television (CCTV) sewer inspection_detections.json"
-        detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\1_detections.json"
+        detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\olympic-St25zdo494Surveyupstream_detections.json"
 
         defectCodePath = "DefectsCode.json"
 

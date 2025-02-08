@@ -20,7 +20,7 @@ from detectron2.data.transforms import ResizeShortestEdge
 import math
 from concurrent.futures import ThreadPoolExecutor
 from TextExtractor.ExtrctInfo import TextExtractor
-
+from statistics import mean
 @dataclass 
 class TimingStats:
 	frame_collection_time: float = 0.0
@@ -237,15 +237,67 @@ class BatchDefectDetector:
 		# Extract text information from frames with detections
 		self.logger.info("Starting text extraction from frames with detections...")
 		text_extractor = TextExtractor()
+		text_extractor._get_user_roi(all_frames[0])
+		distanceBase = 0
+		firstFrame = True
+		ListMean = []
+		prev_timestamp = 0
+		prev_distance = 0
+		time_diff = 0
+		distance_diff = 0
+		# Sort all_detections by timestamp_seconds
+		self.all_detections = dict(sorted(
+			self.all_detections.items(),
+			key=lambda item: item[1]["Detection"]["timestamp_seconds"]
+		))
 		for frameKey, frameDetections in self.all_detections.items():
 			# Extract text from frame
 			self.logger.info(f"Extracting text from frame {frameKey}...")
-			text_info = text_extractor.extract_text_from_video_frame(frameDetections["frame_path"])
+			text_info = text_extractor.extract_text_from_video_frame(frame_path=frameDetections["frame_path"])
 			
-			# Add text info to frame detections
 			split_text = text_info.split(" ")
-			frameDetections["text_info"] = [item for item in split_text if 'm' in item]
+			try:
+				# Clean up multiple decimals, keeping only one decimal place
+				text = split_text[0]
+				decimals = text.count('.')
+				if decimals > 1:
+					# Keep only first decimal and one digit after
+					parts = text.split('.')
+					text = parts[0] + '.' + parts[2]
+				current_distance = float(text)
+				
+				# Get current timestamp
+				current_timestamp = frameDetections["Detection"]["timestamp_seconds"]
+				ListMean.append(current_distance)
+				mean_distance = mean(ListMean)
+				
+				if firstFrame:
+					prev_distance = current_distance
+					prev_timestamp = current_timestamp
+					firstFrame = False
+
+
+				distance_diff = abs(current_distance - distanceBase)
+				time_diff = current_timestamp - prev_timestamp
+				# Use current distance if bigger than mean, otherwise keep mean
+				if current_distance >= distanceBase and distance_diff <= 20 and time_diff < 20:
+					distanceBase = current_distance
+					frameDetections["text_info"] = str(current_distance)
+				else:
+
+					frameDetections["text_info"] = str(distanceBase)
+				
+				# Update previous values
+				prev_timestamp = current_timestamp
+				prev_distance = current_distance
+
+			except (ValueError, IndexError) as e:
+				self.logger.error(f"Error processing text in frame {frameKey}: {str(e)}")
+				frameDetections["text_info"] = distanceBase
+
 			
+			
+
 			# Log extracted text
 			self.logger.info(f"Frame {frameKey}: Extracted text: {text_info}")
 			self.logger.info(f"Frame {frameKey}: Filtered text containing 'm': {frameDetections['text_info']}")
@@ -408,7 +460,7 @@ def main():
 
 	# Process video
 	#input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
-	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\14030828\14030828\1104160202120636299-1104160202120633024\1.mpg"
+	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
 	output_path = os.path.join("output", os.path.basename(input_path))
 	
 	detector.logger.info(f"Processing video: {input_path}")

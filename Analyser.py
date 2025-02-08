@@ -291,7 +291,8 @@ def main():
 	detector = DefectDetector(config)
 
 	# Process video
-	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
+	#input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
+	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\20240610\20240610_104450.AVI"
 	output_path = os.path.join("output", os.path.basename(input_path))
 	
 	detector.logger.info(f"Processing video: {input_path}")
