@@ -24,6 +24,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.data.transforms import ResizeShortestEdge
 
 from TextExtractor.ExtrctInfo import TextExtractor
+from Reporter.ExcelReporter import ExcelReporter
 
 @dataclass
 class TimingStats:
@@ -148,10 +149,71 @@ class BatchDefectDetector:
             self._visualize_batch_default(all_frames, all_predictions, all_timestamps)
 
         self._extract_and_process_text(all_frames)
-        self._save_results(output_path)
+        self.modify_detection_baseExperience()
+        self._save_results(frames_dir)
         self._log_timing_stats(process_start)
+
+
         
         return frames_to_process
+    
+    def modify_detection_baseExperience(self):
+        """Modify detection base experience"""
+        # Group detections by text_info (distance)
+        self.all_detectionsBaseCopy = self.all_detections.copy()
+        distance_groups = {}
+        for frame_key, frame_data in self.all_detections.items():
+            distance = frame_data["text_info"]
+            if distance not in distance_groups:
+                distance_groups[distance] = []
+            distance_groups[distance].append((frame_key, frame_data))
+
+        # For each distance group, keep only the detection with most repetitive class
+        for distance, group in distance_groups.items():
+            # Count class occurrences
+            class_counts = {}
+            for _, frame_data in group:
+                defect_class = frame_data["Detection"]["class"]
+                class_counts[defect_class] = class_counts.get(defect_class, 0) + 1
+
+            # Find most common class
+            most_common_class = max(class_counts.items(), key=lambda x: x[1])[0]
+
+            # Keep only detections with most common class
+            filtered_group = [(k,d) for k,d in group 
+                            if d["Detection"]["class"] == most_common_class][:1]
+
+
+            # Update all_detections to keep only filtered detections
+            self.all_detectionsCopy = {}
+            for frame_key, frame_data in self.all_detections.items():
+                # For frames at current distance, only keep first instance of most common class
+                if frame_data["text_info"] == distance:
+                    if frame_key == filtered_group[0][0]:  # First frame from filtered group
+                        self.all_detectionsCopy[frame_key] = frame_data
+                # Keep all frames from other distances unchanged
+                else:
+                    self.all_detectionsCopy[frame_key] = frame_data
+
+            self.all_detections = self.all_detectionsCopy
+
+        # Remove any detections not in filtered groups and their associated frames
+        keys_to_remove = []
+        modifyKeys = [self.all_detections.keys()]
+        OriginalKeys = [self.all_detectionsBaseCopy.keys()]
+
+        for key, frame_data in self.all_detectionsBaseCopy.items():
+            if key not in self.all_detections:
+
+                self.logger.info(f"Frame {key} was in original detections but removed in filtering")               # Remove associated frame image if it exists
+                if "frame_path" in frame_data:
+                    try:
+                        os.remove(frame_data["frame_path"])
+                        self.logger.info(f"Removed frame image: {frame_data['frame_path']}")
+                    except Exception as e:
+                        self.logger.error(f"Error removing frame image {frame_data['frame_path']}: {str(e)}")
+
+
     def _collect_frames(self, input_path: str):
         """Collect frames from video file"""
         self.text_extractor = TextExtractor()
@@ -461,7 +523,9 @@ class BatchDefectDetector:
 
     def _save_results(self, output_path):
         """Save detection results to JSON"""
-        json_output_path = os.path.splitext(output_path)[0] + "_detections.json"
+        base_name = os.path.basename(output_path).split("_")[0]
+        
+        json_output_path = os.path.join(output_path, base_name + "_detections.json")
         with open(json_output_path, 'w') as f:
             json.dump(self.all_detections, f, indent=4)
         self.logger.info(f"Detection data saved to {json_output_path}")
@@ -499,13 +563,18 @@ def main():
         config_path="Model/mask_rcnn_X_101_32x8d_FPN_3x.yaml",
     )
     
-    detector = BatchDefectDetector(config)
-    input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
+    # detector = BatchDefectDetector(config)
+    # input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
     input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
     output_path = os.path.join("output", os.path.basename(input_path))
     
-    detector.logger.info(f"Processing video: {input_path}")
-    detector.process_video(input_path, output_path, batch_size=config.batch_size)
+    # detector.logger.info(f"Processing video: {input_path}")
+    # detector.process_video(input_path, output_path, batch_size=config.batch_size)
+    reporter = ExcelReporter(
+        input_path = os.path.splitext(output_path)[0] + "_frames",
+        excelOutPutName = "Condition-Details.xlsx"
+    )
+    reporter.generate_report()
 
 if __name__ == "__main__":
     main()

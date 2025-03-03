@@ -24,8 +24,9 @@ class ExcelStyles:
     data_font: Font = Font(color="000000")
 
 class ExcelReporter:
-    def __init__(self, excelOutPutName: str):
-        self.output_path = os.path.join("output", excelOutPutName)
+    def __init__(self, excelOutPutName: str, input_path: str):
+        self.input_path = input_path
+        self.Excel_output_path = os.path.join(input_path, excelOutPutName)
         self.DefectsCodeDict = {}
         self.workbook = Workbook()
         self.sheet = self.workbook.active
@@ -122,6 +123,7 @@ class ExcelReporter:
             "Root": "ریشه درخت",
             "Infiltration": "نفوذ آب", 
             "Leak": "نشت آب",
+            "Broken": "شکستگی",
             "Deposits": "رسوب",
             "Infiltration of soil": "نفوذ خاک",
             "Obstacle": "مانع",
@@ -151,19 +153,24 @@ class ExcelReporter:
     def generate_report(self) -> None:
         """Generate the Excel report"""
         #detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\Closed circuit television (CCTV) sewer inspection_detections.json"
-        detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\olympic-St25zdo494Surveyupstream_detections.json"
+        #detectionDataPath = r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\olympic-St25zdo494Surveyupstream_detections.json"
 
-        defectCodePath = "DefectsCode.json"
+        #defectCodePath = "DefectsCode.json"
+        # Get parent folder of detection data path
+        base_name = os.path.basename(self.input_path).split("_")[0]
+        detection_data_dir = os.path.join(self.input_path, f"{base_name}_detections.json")
 
-        detectionData = self.load_json_data(detectionDataPath)
+        defectCodePath = "output/DefectsCode.json"
+        
+        detectionData = self.load_json_data(detection_data_dir)
         defectCodeData = self.load_json_data(defectCodePath)
 
         self.apply_header_styling()
         self.createCodeMapData(defectCodeData)
         self.write_data_rows(detectionData)
         self.adjust_column_widths()
-        self.workbook.save(self.output_path)
-        print(f"Excel file with modern styling created: {self.output_path}")
+        self.workbook.save(self.Excel_output_path)
+        print(f"Excel file with modern styling created: {self.Excel_output_path}")
 
 if __name__ == "__main__":
     reporter = ExcelReporter(

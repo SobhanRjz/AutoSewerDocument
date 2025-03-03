@@ -23,10 +23,15 @@ class TextExtractor:
         self.easy_ocr = easyocr.Reader(['en'], gpu=True)
 
         # Initialize GOT-OCR model
+        proxies = {
+            "http": "http://127.0.0.1:10808",
+            "https": "http://127.0.0.1:10808",
+        }
         self.tokenizer = AutoTokenizer.from_pretrained(
             'ucaslcl/GOT-OCR2_0', 
             trust_remote_code=True,
-            use_fast = True
+            use_fast = True,
+            proxies=proxies
         )
 
         self.model = self._initialize_got_ocr_model()
@@ -42,6 +47,10 @@ class TextExtractor:
 
     def _initialize_got_ocr_model(self):
         """Initialize and optimize the GOT-OCR model"""
+        proxies = {
+            "http": "http://127.0.0.1:10808",
+            "https": "http://127.0.0.1:10808",
+        }
         model = AutoModel.from_pretrained(
             'ucaslcl/GOT-OCR2_0',
             trust_remote_code=True,
@@ -50,6 +59,7 @@ class TextExtractor:
             use_safetensors=True,
             pad_token_id=self.tokenizer.eos_token_id,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            proxies=proxies
         ).to(self.device, non_blocking=True)
 
         model.half()
@@ -97,7 +107,7 @@ class TextExtractor:
         return self.roi_coords
 
     @torch.inference_mode()
-    def _extract_text_gotocr(self, image):
+    def _extract_text_Complete(self, image):
         """Extract text using GOT-OCR model"""
         if not isinstance(image, Image.Image):
             image = Image.fromarray(image)
@@ -141,7 +151,7 @@ class TextExtractor:
         if save_crop:
             Image.fromarray(processed).save("cropped_image.png")
 
-        return (self._extract_text_gotocr if UseGOTOCR else self._extract_text_easyocr)(processed)
+        return (self._extract_text_Complete if UseGOTOCR else self._extract_text_easyocr)(processed)
 
 
 

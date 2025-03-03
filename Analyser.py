@@ -180,10 +180,13 @@ class DefectDetector:
 				timestamp = frame_count / fps
 				
 				output_frame, has_detections = self._process_single_frame(frame, timestamp)
-				writer.write(output_frame)
 				
-				# Store frame info if defects were detected
 				if has_detections:
+					# for _ in range(6):
+					# 	writer.write(output_frame)
+					
+				# Store frame info if defects were detected
+				
 					output_frames.append({
 						'frame': output_frame,
 						'timestamp': timestamp,
@@ -197,7 +200,8 @@ class DefectDetector:
 				
 				if cv2.waitKey(int(1000 / fps)) & 0xFF == ord('q'):
 					break
-
+			else:
+				writer.write(frame)
 			frame_count += 1
 
 		self.timing_stats.frame_collection_time = time.time() - frame_collection_start
@@ -291,8 +295,11 @@ def main():
 	detector = DefectDetector(config)
 
 	# Process video
-	#input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
-	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\20240610\20240610_104450.AVI"
+	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
+	#input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\20240610\20240610_104450.AVI"
+	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\14030830\14030830\1104160202120663062-1104160202120663075\1.mpg"
+	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\08- 493.1 to 493\olympicSt25zdo4931Surveyupstream.mpg"
+
 	output_path = os.path.join("output", os.path.basename(input_path))
 	
 	detector.logger.info(f"Processing video: {input_path}")
