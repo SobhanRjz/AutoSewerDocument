@@ -6,6 +6,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
+from utils.logger import ProgressLogger
+
 @dataclass
 class ExcelStyles:
     """Styles for Excel formatting"""
@@ -24,7 +26,7 @@ class ExcelStyles:
     data_font: Font = Font(color="000000")
 
 class ExcelReporter:
-    def __init__(self, excelOutPutName: str, input_path: str):
+    def __init__(self, excelOutPutName: str, input_path: str, progress_logger: ProgressLogger):
         self.input_path = input_path
         self.Excel_output_path = os.path.join(input_path, excelOutPutName)
         self.DefectsCodeDict = {}
@@ -32,6 +34,7 @@ class ExcelReporter:
         self.sheet = self.workbook.active
         self.sheet.title = "Condition Details"
         self.styles = ExcelStyles()
+        self.progress_logger = progress_logger
         self.headers = [
             "زمان بر روی ویدئو", "مسیر تصویر", "فاصله از نقطه شروع", "عیوب پیوسته", "کد عیوب",
             "نام فارسی عیوب", "عیب در محل اتصال", "جنس", "شدت عیب", "ابعاد یک", "ابعاد دو",
@@ -72,7 +75,17 @@ class ExcelReporter:
 
     def write_data_rows(self, json_data: Dict) -> None:
         """Write and style data rows"""
+        total_rows = len(json_data)
+        
         for row_num, (image_key, entry) in enumerate(json_data.items(), 2):
+            # Update progress for excel reporting stage
+            progress = ((row_num - 1) / total_rows) * 100
+            self.progress_logger.update_stage_progress(
+                "excel reporting",
+                progress,
+                {"status": f"Writing row {row_num-1} of {total_rows}"}
+            )
+            
             fill = self.styles.data_fill_even if row_num % 2 == 0 else self.styles.data_fill_odd
             
             for col_num, header in enumerate(self.headers, 1):
@@ -102,12 +115,17 @@ class ExcelReporter:
                     raw_value = entry[key[0]][key[1]]
                     value = self.DefectsCodeDict["BasicName_fa"][raw_value]
 
-
                 cell.value = value
                 cell.font = self.styles.data_font
                 cell.alignment = self.styles.data_alignment
                 cell.border = self.styles.header_border
                 cell.fill = fill
+                
+        # Mark excel reporting stage as complete
+        self.progress_logger.complete_stage(
+            "excel reporting",
+            {"status": "Finished writing all data rows"}
+        )
 
     def adjust_column_widths(self) -> None:
         """Adjust column widths based on content"""

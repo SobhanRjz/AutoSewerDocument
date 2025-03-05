@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from statistics import mean
 from tqdm import tqdm
+import traceback
 
 from detectron2.utils.logger import setup_logger
 from detectron2.engine import DefaultPredictor
@@ -25,6 +26,8 @@ from detectron2.data.transforms import ResizeShortestEdge
 
 from TextExtractor.ExtrctInfo import TextExtractor
 from Reporter.ExcelReporter import ExcelReporter
+from utils.logger import ProgressLogger
+
 
 @dataclass
 class TimingStats:
@@ -56,19 +59,58 @@ class BatchDefectDetector:
         self.timing_stats = TimingStats()
         self.custom_batch = config.custom_batch
         self.all_detections = {}
+        
+        # Initialize progress logger
+        self.progress_logger = ProgressLogger()
+        # Initialize stages with their weights
+        self.stages = {
+            "initialization": 5,
+            "frame extraction": 10,
+            "Ai detection": 40,
+            "text extraction": 30,
+            "excel reporting": 15
+        }
+        self.progress_logger.start_process(self.stages)
+
+        # Update progress for initialization stage
+        self.progress_logger.update_stage_progress(
+            "initialization",
+            80.0,
+            {"status": "Setting up detector configuration"}
+        )
 
     def _setup_logging(self):
         """Configure logging with detailed format"""
+        # Create logs directory if it doesn't exist
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            
+        log_file = os.path.join(log_dir, "defect_detection.log")
+        
+        # Configure root logger
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.StreamHandler(sys.stdout),
-                logging.FileHandler('defect_detection.log')
+                logging.FileHandler(log_file, mode='a')
             ]
         )
+        
+        # Create logger for this class
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
+        
+        # Add file handler with rotation
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        )
+        self.logger.addHandler(file_handler)
+        
+        # Log startup message
+        self.logger.info("Initializing BatchDefectDetector")
 
     def _initialize_model(self, config: DetectionConfig):
         """Initialize model and related components"""
@@ -127,6 +169,11 @@ class BatchDefectDetector:
         return batch_inputs
 
     def process_video(self, input_path: str, output_path: str, batch_size: int = 8):
+        self.progress_logger.complete_stage(
+            "initialization",
+            {"status": "Detector configuration setup complete"}
+        )
+
         """Process video file in batches for object detection"""
         process_start = time.time()
         
@@ -153,8 +200,6 @@ class BatchDefectDetector:
         self._save_results(frames_dir)
         self._log_timing_stats(process_start)
 
-
-        
         return frames_to_process
     
     def modify_detection_baseExperience(self):
@@ -245,7 +290,13 @@ class BatchDefectDetector:
         self.timing_stats.frame_collection_time = time.time() - frame_collection_start
         self.logger.info(f"Frame collection complete. Total frames: {len(frames_to_process)}. "
                         f"Time taken: {self.timing_stats.frame_collection_time:.2f}s")
+        
+        self.progress_logger.complete_stage(
+            "frame extraction",
+            {"status": "Frame collection complete"}
+        )
                         
+
         return frames_to_process, timestamps_to_process
 
     def _read_frames(self, cap, total_frames, frame_interval, frame_queue):
@@ -260,6 +311,15 @@ class BatchDefectDetector:
                 frame_queue.put((frame_idx, frame))
             frame_idx += 1
             pbar.update(1)
+            
+            # Update progress for frame extraction stage
+            progress = (frame_idx / total_frames) * 100
+            if frame_idx % 5 == 0:
+                self.progress_logger.update_stage_progress(
+                    "frame extraction",
+                    progress,
+                    {"frames_processed": frame_idx, "total_frames": total_frames}
+                )
         frame_queue.put(None)
         pbar.close()
 
@@ -289,7 +349,6 @@ class BatchDefectDetector:
             batch = frames[i:i + batch_size]
             batch_timestamps = timestamps[i:i + batch_size]
 
-            
             current_batch = i // batch_size + 1
             pbar.set_description(f"Processing batch {current_batch}/{total_batches}")
             
@@ -310,6 +369,23 @@ class BatchDefectDetector:
             pbar.set_postfix({"Batch time": f"{batch_time:.2f}s", "Total time": f"{total_batch_time:.2f}s"})
             batch_start_time = time.time()
             
+            # Update progress for AI detection stage
+            progress = (current_batch / total_batches) * 100
+            self.progress_logger.update_stage_progress(
+                "Ai detection",
+                progress,
+                {
+                    "batch": current_batch,
+                    "total_batches": total_batches,
+                    "batch_time": f"{batch_time:.2f}s",
+                    "total_time": f"{total_batch_time:.2f}s"
+                }
+            )
+        
+        self.progress_logger.complete_stage(
+            "Ai detection",
+            {"status": "AI detection complete"}
+        )
         return all_predictions, all_frames, all_timestamps
 
     def _predict_batch(self, batch):
@@ -331,6 +407,7 @@ class BatchDefectDetector:
     def _visualize_batch(self, batch, outputs, timestamps, frames_dir):
         """Visualize results from custom batch processing"""
         vis_start = time.time()
+        Normal_frames = []
         frames_with_detections = []
         frame_count = 0
         
@@ -342,16 +419,26 @@ class BatchDefectDetector:
                 frame_count += 1
                 self._process_detections(instances, frame_count, timestamp)
                 
-                frame_to_save = batch[frame_idx] if not self._should_draw_predictions() else \
-                               self._draw_predictions(batch[frame_idx], instances)
+                frame_to_save = batch[frame_idx] 
+                frame_to_save_with_predictions = self._draw_predictions(batch[frame_idx], instances)
                                
-                frames_with_detections.append({
+                Normal_frames.append({
                     'frame': frame_to_save,
                     'timestamp': timestamp,
                     'frame_idx': frame_count
                 })
+                frames_with_detections.append({
+                    'frame': frame_to_save_with_predictions,
+                    'timestamp': timestamp,
+                    'frame_idx': frame_count
+                })
+        # Save normal frames
+        self._save_detection_frames(frames_dir, Normal_frames)
+        # Save frames with predictions
+        predictions_frames_dir = os.path.join(frames_dir, "predictions_frames")
+        os.makedirs(predictions_frames_dir, exist_ok=True)
+        self._save_detection_frames(predictions_frames_dir, frames_with_detections)
         
-        self._save_detection_frames(frames_dir, frames_with_detections)
         self.timing_stats.visualization_time += time.time() - vis_start
 
     def _process_detections(self, instances, frame_count, timestamp):
@@ -429,16 +516,28 @@ class BatchDefectDetector:
             key=lambda item: item[1]["Detection"]["timestamp_seconds"]
         ))
         
-        pbar = tqdm(self.all_detections.items(), desc="Processing frame text",colour="cyan")
+        pbar = tqdm(self.all_detections.items(), desc="Processing frame text", colour="cyan")
+        total_frames = len(self.all_detections)
         
-        for frame_key, frame_data in pbar:
+        for i, (frame_key, frame_data) in enumerate(pbar):
             self._process_frame_text(
                 frame_key, frame_data,
                 first_frame, distance_means,
                 prev_timestamp, prev_distance
             )
-
             
+            # Update progress for text extraction stage
+            progress = ((i + 1) / total_frames) * 100
+            self.progress_logger.update_stage_progress(
+                "text extraction",
+                progress,
+                {"frames_processed": i + 1, "total_frames": total_frames}
+            )
+        self.progress_logger.complete_stage(
+            "text extraction",
+            {"status": "Text extraction complete"}
+        )
+
         self.timing_stats.text_extraction_time = time.time() - text_extraction_start
         self.logger.info(f"Text extraction completed. Time taken: {self.timing_stats.text_extraction_time:.2f}s")
 
@@ -550,31 +649,47 @@ class BatchDefectDetector:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def main():
-    config = DetectionConfig(
-        class_names=[
-            "Crack", "Obstacle", "Deposits", "Deformed",
-            "Broken", "Joint Displaced", "Surface Damage", "Root"
-        ],
-        colors=[
-            [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-            [255, 0, 255], [0, 255, 255], [128, 128, 128], [128, 0, 128]
-        ],
-        model_path="Model/model_final.pth",
-        config_path="Model/mask_rcnn_X_101_32x8d_FPN_3x.yaml",
-    )
-    
-    # detector = BatchDefectDetector(config)
-    # input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
-    input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
-    output_path = os.path.join("output", os.path.basename(input_path))
-    
-    # detector.logger.info(f"Processing video: {input_path}")
-    # detector.process_video(input_path, output_path, batch_size=config.batch_size)
-    reporter = ExcelReporter(
-        input_path = os.path.splitext(output_path)[0] + "_frames",
-        excelOutPutName = "Condition-Details.xlsx"
-    )
-    reporter.generate_report()
+    try:
+        # if len(sys.argv) != 2:
+        #     print("Usage: python YourPythonScript.py <video_path>")
+        #     return
+
+        # input_path = sys.argv[1]
+        # if not os.path.isfile(input_path):
+        #     print("Invalid video path provided.")
+        #     return
+        # print(input_path)
+
+        config = DetectionConfig(
+            class_names=[
+                "Crack", "Obstacle", "Deposits", "Deformed",
+                "Broken", "Joint Displaced", "Surface Damage", "Root"
+            ],
+            colors=[
+                [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+                [255, 0, 255], [0, 255, 255], [128, 128, 128], [128, 0, 128]
+            ],
+            model_path="Model/model_final.pth",
+            config_path="Model/mask_rcnn_X_101_32x8d_FPN_3x.yaml",
+        )
+        
+        detector = BatchDefectDetector(config)
+        # input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
+        input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
+        output_path = os.path.join("output", os.path.basename(input_path))
+        
+        detector.logger.info(f"Processing video: {input_path}")
+        detector.process_video(input_path, output_path, batch_size=config.batch_size)
+        reporter = ExcelReporter(
+            input_path = os.path.splitext(output_path)[0] + "_frames",
+            excelOutPutName = "Condition-Details.xlsx",
+            progress_logger = detector.progress_logger
+        )
+        reporter.generate_report()
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+        time.sleep(15)
+        return
 
 if __name__ == "__main__":
     main()

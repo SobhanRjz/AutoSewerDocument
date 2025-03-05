@@ -100,9 +100,43 @@ class TextExtractor:
             self.roi_coords = (0, 0, width, height)
             return self.roi_coords
 
-        cv2.namedWindow("Select Region", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Select Region", 800, 600)
-        self.roi_coords = cv2.selectROI("Select Region", image)
+        # Create window with instructions
+        window_name = "Select Region of Interest"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1024, 768)
+        
+        # Set window to be always on top
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+
+        # Add instructions overlay
+        img_with_text = image.copy()
+        instructions = [
+            "Instructions:",
+            "1. Click and drag to select region", 
+            "2. Press SPACE or ENTER to confirm",
+            "3. Press C to cancel selection",
+            "4. Press ESC to exit"
+        ]
+
+        # Add semi-transparent overlay
+        overlay = img_with_text.copy()
+        cv2.rectangle(overlay, (10, 10), (300, 150), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.3, img_with_text, 0.7, 0, img_with_text)
+
+        # Add text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        y = 40
+        for line in instructions:
+            cv2.putText(img_with_text, line, (20, y), font, 0.7, (255, 255, 255), 2)
+            y += 25
+
+        # Show window and bring to front
+        cv2.imshow(window_name, img_with_text)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+
+        # Get ROI with enhanced selectROI
+        self.roi_coords = cv2.selectROI(window_name, img_with_text, False)
         cv2.destroyAllWindows()
         return self.roi_coords
 
