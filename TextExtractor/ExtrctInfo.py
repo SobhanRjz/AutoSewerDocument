@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import torch
@@ -27,11 +28,21 @@ class TextExtractor:
             "http": "http://127.0.0.1:10808",
             "https": "http://127.0.0.1:10808",
         }
+    
+        # Get the directory where this file is located
+        self.file_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.OCR_model_path = os.path.join(self.file_dir, 'OCRModel')
+
+        # Check if the local OCR model path exists
+        if not os.path.exists(self.OCR_model_path):
+            # If local path doesn't exist, use the remote model path
+            self.OCR_model_path = 'ucaslcl/GOT-OCR2_0'
+            print(f"Local OCR model not found. Using remote model: {self.OCR_model_path}")
+
         self.tokenizer = AutoTokenizer.from_pretrained(
-            'ucaslcl/GOT-OCR2_0', 
+            self.OCR_model_path, 
             trust_remote_code=True,
-            use_fast = True,
-            proxies=proxies
+            use_fast = True
         )
 
         self.model = self._initialize_got_ocr_model()
@@ -52,14 +63,13 @@ class TextExtractor:
             "https": "http://127.0.0.1:10808",
         }
         model = AutoModel.from_pretrained(
-            'ucaslcl/GOT-OCR2_0',
+            self.OCR_model_path,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
             device_map=self.device,
             use_safetensors=True,
             pad_token_id=self.tokenizer.eos_token_id,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            proxies=proxies
         ).to(self.device, non_blocking=True)
 
         model.half()
