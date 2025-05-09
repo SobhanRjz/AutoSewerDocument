@@ -186,3 +186,7 @@ output/1.mpg
 output/20240610_104450.AVI
 output/Closed circuit television (CCTV) sewer inspection.mp4
 output/olympicSt25zdo4931Surveyupstream.mpg
+*.safetensors
+*.pt
+*.pth
+*.onnx

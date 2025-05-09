@@ -965,15 +965,15 @@ class BatchDefectDetector:
 
 def main():
     try:
-        if len(sys.argv) != 2:
-            print("Usage: python YourPythonScript.py <video_path>")
-            return
+        # if len(sys.argv) != 2:
+        #     print("Usage: python YourPythonScript.py <video_path>")
+        #     return
 
-        input_path = sys.argv[1]
-        if not os.path.isfile(input_path):
-            print("Invalid video path provided.")
-            return
-        print(input_path)
+        # input_path = sys.argv[1]
+        # if not os.path.isfile(input_path):
+        #     print("Invalid video path provided.")
+        #     return
+        # print(input_path)
 
         # Get the directory where the current script is located
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
