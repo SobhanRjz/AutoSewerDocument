@@ -6,6 +6,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
+import sys
+import os
+
+# Add parent directory to path to allow imports from sibling directories
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from utils.logger import ProgressLogger
 
 @dataclass
@@ -76,51 +82,87 @@ class ExcelReporter:
     def write_data_rows(self, json_data: Dict) -> None:
         """Write and style data rows"""
         total_rows = len(json_data)
-        
-        for row_num, (image_key, entry) in enumerate(json_data.items(), 2):
-            # Update progress for excel reporting stage
-            progress = ((row_num - 1) / total_rows) * 100
-            self.progress_logger.update_stage_progress(
-                "excel reporting",
-                progress,
-                {"status": f"Writing row {row_num-1} of {total_rows}"}
-            )
-            
-            fill = self.styles.data_fill_even if row_num % 2 == 0 else self.styles.data_fill_odd
-            
-            for col_num, header in enumerate(self.headers, 1):
-                cell = self.sheet.cell(row=row_num, column=col_num)
-                key = self.data_mapping.get(header)
+        row_num = 2
 
-                if key:
-                    if header == "زمان بر روی ویدئو":
-                        value = self.format_timestamp(float(entry["Detection"][key]))
-                    elif header == "فاصله از نقطه شروع":
-                        value = entry.get(key, [])
-                    elif header == "کد عیوب":
-                        raw_value = entry[key[0]][key[1]]
-                        value = self.DefectsCodeDict.get(raw_value, raw_value)
-                    elif header == "شدت عیب":
-                        value = entry[key[0]][key[1]]
-                    elif header == "نام فارسی عیوب":
-                        raw_value = entry[key[0]][key[1]]
-                        value = self.DefectsCodeDict["BasicName_fa"].get(raw_value, raw_value)
-                    else:
-                        value = entry.get(key, "")
-                else:
-                    value = ""
-
-                if header == "نام فارسی عیوب":
-                    key = self.data_mapping.get("کد عیوب")
-                    raw_value = entry[key[0]][key[1]]
-                    value = self.DefectsCodeDict["BasicName_fa"][raw_value]
-
-                cell.value = value
-                cell.font = self.styles.data_font
-                cell.alignment = self.styles.data_alignment
-                cell.border = self.styles.header_border
-                cell.fill = fill
+        try:
+            for _, (image_key, entry) in enumerate(json_data.items(), 0):
+                # Update progress for excel reporting stage
+                progress = ((row_num - 1) / total_rows) * 100
+                if row_num % 10 == 0:
+                    self.progress_logger.update_stage_progress(
+                        "excel reporting",
+                        progress,
+                        {"status": f"Writing row {row_num-1} of {total_rows}"}
+                    )
                 
+                fill = self.styles.data_fill_even if row_num % 2 == 0 else self.styles.data_fill_odd
+                
+                # Check if Detection is a list and process each detection as a separate row
+                detections = entry.get("Detection", [])
+                if not isinstance(detections, list):
+                    detections = [detections]
+                
+                # If there are multiple detections, we'll add rows for each one
+                for detection_idx, detection in enumerate(detections, 0):
+                    current_row = row_num + detection_idx
+                    
+                    # Create a new row if needed (after the first detection)
+                    if detection_idx > 0:
+                        # Apply the alternating fill pattern
+                        fill = self.styles.data_fill_even if current_row % 2 == 0 else self.styles.data_fill_odd
+                    
+                    for col_num, header in enumerate(self.headers, 1):
+                        cell = self.sheet.cell(row=current_row, column=col_num)
+                        key = self.data_mapping.get(header)
+                        
+                        if key:
+                            if header == "زمان بر روی ویدئو":
+                                value = self.format_timestamp(float(detection[key]))
+                            elif header == "فاصله از نقطه شروع":
+                                value = entry.get(key, [])
+                            elif header == "کد عیوب":
+                                raw_value = detection[key[1]]
+                                value = self.DefectsCodeDict.get(raw_value, raw_value)
+                            elif header == "شدت عیب":
+                                value = detection[key[1]]
+                            elif header == "نام فارسی عیوب":
+                                raw_value = detection[key[1]]
+                                value = self.DefectsCodeDict["BasicName_fa"].get(raw_value, raw_value)
+                            else:
+                                # For other fields, check if they're in detection or entry
+                                if isinstance(key, list):
+                                    value = detection.get(key[1], entry.get(key, ""))
+                                else:
+                                    value = detection.get(key, entry.get(key, ""))
+                        else:
+                            value = ""
+                        
+                        if header == "نام فارسی عیوب":
+                            key = self.data_mapping.get("کد عیوب")
+                            raw_value = detection[key[1]]
+                            value = self.DefectsCodeDict["BasicName_fa"].get(raw_value, raw_value)
+                        
+                        cell.value = value
+                        cell.font = self.styles.data_font
+                        cell.alignment = self.styles.data_alignment
+                        cell.border = self.styles.header_border
+                        cell.fill = fill
+                
+                # Adjust row_num to account for the added rows
+                row_num += len(detections)
+        except Exception as e:
+            # Mark excel reporting stage as complete
+            self.progress_logger.complete_stage(
+                "excel reporting",
+                {"status": "Finished writing all data rows"}
+            )
+            return
+
+        self.progress_logger.update_stage_progress(
+                    "excel reporting",
+                    100,
+                    {"status": f"Finished writing all data rows"}
+                )   
         # Mark excel reporting stage as complete
         self.progress_logger.complete_stage(
             "excel reporting",
@@ -176,10 +218,16 @@ class ExcelReporter:
         #defectCodePath = "DefectsCode.json"
         # Get parent folder of detection data path
         base_name = os.path.basename(self.input_path).split("_")[0]
-        detection_data_dir = os.path.join(self.input_path, f"{base_name}_detections.json")
+        detection_data_dir = os.path.join(self.input_path, f"frames_detections.json")
 
-        defectCodePath = "output/DefectsCode.json"
-        
+        #defectCodePath = "output/DefectsCode.json"
+        # Get the directory where the current script is located
+        # Get the parent directory (project root) by going up one level from the current file
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # Build the path to 'model/v2'
+        defectCodePath = os.path.join(BASE_DIR, 'output', 'DefectsCode.json')
+
         detectionData = self.load_json_data(detection_data_dir)
         defectCodeData = self.load_json_data(defectCodePath)
 
@@ -187,11 +235,26 @@ class ExcelReporter:
         self.createCodeMapData(defectCodeData)
         self.write_data_rows(detectionData)
         self.adjust_column_widths()
-        self.workbook.save(self.Excel_output_path)
+        try:
+            self.workbook.save(self.Excel_output_path)
+        except PermissionError:
+            self.progress_logger.log_message("Excel file is open. Attempting to close it...")
+            try:
+                # Close the workbook if it's open
+                if hasattr(self, '_archive'):
+                    self.workbook.close()
+                # Try saving again
+                self.workbook.save(self.Excel_output_path)
+                self.progress_logger.log_message("Successfully saved Excel file after closing.")
+            except Exception as e:
+                self.progress_logger.log_message(f"Error saving Excel file: {str(e)}")
+                raise
         print(f"Excel file with modern styling created: {self.Excel_output_path}")
 
 if __name__ == "__main__":
     reporter = ExcelReporter(
-        "modern_styled_condition_details_filled.xlsx"
+        "modern_styled_condition_details_filled.xlsx",
+        r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\olympicSt25zdo4931Surveyupstream_output",
+        ProgressLogger()
     )
     reporter.generate_report()

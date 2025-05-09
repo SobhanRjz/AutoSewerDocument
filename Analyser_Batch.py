@@ -187,7 +187,7 @@ class BatchDefectDetector:
         )
         
         # Visualize and save results
-        frames_dir = os.path.splitext(output_path)[0] + "_frames"
+        frames_dir = os.path.join(output_path, "frames")
         os.makedirs(frames_dir, exist_ok=True)
         
         if self.custom_batch:
@@ -197,56 +197,316 @@ class BatchDefectDetector:
 
         self._extract_and_process_text(all_frames)
         self.modify_detection_baseExperience()
-        self._save_results(frames_dir)
+        self._save_results(output_path)
         self._log_timing_stats(process_start)
 
         return frames_to_process
     
     def modify_detection_baseExperience(self):
-        """Modify detection base experience"""
-        # Group detections by text_info (distance)
-        self.all_detectionsBaseCopy = self.all_detections.copy()
-        distance_groups = {}
-        for frame_key, frame_data in self.all_detections.items():
-            distance = frame_data["text_info"]
-            if distance not in distance_groups:
-                distance_groups[distance] = []
-            distance_groups[distance].append((frame_key, frame_data))
 
-        # For each distance group, keep only the detection with most repetitive class
-        for distance, group in distance_groups.items():
-            # Count class occurrences
-            class_counts = {}
-            for _, frame_data in group:
-                defect_class = frame_data["Detection"]["class"]
-                class_counts[defect_class] = class_counts.get(defect_class, 0) + 1
-
-            # Find most common class
-            most_common_class = max(class_counts.items(), key=lambda x: x[1])[0]
-
-            # Keep only detections with most common class
-            filtered_group = [(k,d) for k,d in group 
-                            if d["Detection"]["class"] == most_common_class][:1]
-
-
-            # Update all_detections to keep only filtered detections
-            self.all_detectionsCopy = {}
+        try:
+            """Modify detection base experience"""
+            # Group detections by text_info (distance)
+            self.all_detectionsBaseCopy = self.all_detections.copy()
+            distance_groups = {}
             for frame_key, frame_data in self.all_detections.items():
-                # For frames at current distance, only keep first instance of most common class
-                if frame_data["text_info"] == distance:
-                    if frame_key == filtered_group[0][0]:  # First frame from filtered group
-                        self.all_detectionsCopy[frame_key] = frame_data
-                # Keep all frames from other distances unchanged
-                else:
-                    self.all_detectionsCopy[frame_key] = frame_data
+                distance = frame_data["text_info"]
+                if distance not in distance_groups:
+                    distance_groups[distance] = []
+                distance_groups[distance].append((frame_key, frame_data))
 
-            self.all_detections = self.all_detectionsCopy
+            # Process detection groups based on detection count
+            filtered_groups = {}
+            
+            for distance, group in distance_groups.items():
+                # Check if all frames in this group have exactly 1 detection
+                all_single_detection = all(len(frame_data["Detection"]) == 1 for _, frame_data in group)
+                
+                if all_single_detection:
+                    # If all frames have exactly 1 detection, keep the most repetitive class
+                    class_counts = {}
+                    for _, frame_data in group:
+                        defect_class = frame_data["Detection"][0]["class"]
+                        class_counts[defect_class] = class_counts.get(defect_class, 0) + 1
+                    
+                    # Find the most common class
+                    most_common_class = max(class_counts.items(), key=lambda x: x[1])[0] if class_counts else None
+                    
+                    # Keep only frames with the most common class
+                    if most_common_class:
+                        filtered_frames = []
+                        for frame_key, frame_data in group:
+                            if frame_data["Detection"][0]["class"] == most_common_class:
+                                filtered_frames.append((frame_key, frame_data))
+                        
+                        filtered_groups[distance] = filtered_frames
+                        self.logger.info(f"Distance {distance}: Kept {len(filtered_frames)} frames with most common class '{most_common_class}'")
+                else:
+                    # If some frames have multiple detections, keep only those with 2+ detections
+                    multi_detection_frames = []
+                    for frame_key, frame_data in group:
+                        if len(frame_data["Detection"]) >= 2:
+                            multi_detection_frames.append((frame_key, frame_data))
+                    
+                    if multi_detection_frames:
+                        filtered_groups[distance] = multi_detection_frames
+                        self.logger.info(f"Distance {distance}: Kept {len(multi_detection_frames)} frames with 2+ detections")
+            
+            
+            # First, filter out duplicate detections within each frame
+            for distance, group in filtered_groups.items():
+                for frame_idx, (frame_key, frame_data) in enumerate(group):
+                    # Track unique classes we've seen in this frame
+                    seen_classes = set()
+                    unique_detections = []
+                    
+                    # Process each detection and keep only unique classes
+                    for detection in frame_data["Detection"]:
+                        defect_class = detection["class"]
+                        if defect_class not in seen_classes:
+                            seen_classes.add(defect_class)
+                            unique_detections.append(detection)
+                    
+                    # Update the frame data with unique detections
+                    frame_data["Detection"] = unique_detections
+                    group[frame_idx] = (frame_key, frame_data)
+                    
+                # Update the distance group with the modified frames
+                distance_groups[distance] = group
+                
+            # Now filter out duplicate frames that have identical class combinations
+            for distance, group in distance_groups.items():
+                # Track unique class combinations we've seen
+                unique_class_combinations = []
+                unique_frames = []
+                
+                for frame_key, frame_data in group:
+                    # Get sorted list of classes in this frame
+                    frame_classes = sorted([d["class"] for d in frame_data["Detection"]])
+                    class_combination = tuple(frame_classes)
+                    
+                    # If we haven't seen this combination before, keep it
+                    if class_combination not in unique_class_combinations:
+                        unique_class_combinations.append(class_combination)
+                        unique_frames.append((frame_key, frame_data))
+                
+                # Update the distance group with unique frames
+                distance_groups[distance] = unique_frames
+                
+            self.logger.info(f"Filtered detection groups to keep only unique class combinations")
+
+            # Filter out frames that are too close to each other (less than 0.15m apart)
+            self.logger.info("Filtering frames that are too close to each other (< 0.15m)")
+            
+            # Convert distance strings to floats and sort them
+            distances = sorted([(d) for d in distance_groups.keys()])
+            
+            # Create a new filtered dictionary to store the results
+            final_filtered_groups = {}
+            
+            # Process distances in order
+            i = 0
+            while i < len(distances):
+                current_distance = distances[i]
+                current_key = str(current_distance)
+                
+                # Add the first distance to our filtered results
+                if i == 0:
+                    final_filtered_groups[current_key] = distance_groups[current_key]
+                    i += 1
+                    continue
+                
+                # Get the previous distance we kept
+                prev_distance = distances[i-1]
+                prev_key = str(prev_distance)
+                
+                # Check if current distance is too close to previous one
+                # Convert to float for numerical comparison
+                if float(current_distance) - float(prev_distance) < 0.15:
+                    # Compare the number of detections
+                    current_frames = distance_groups[current_key]
+                    prev_frames = distance_groups[current_key]  # Use from final_filtered_groups instead
+                    
+                    # Count total detections in current distance group
+                    current_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in current_frames)
+                    
+                    # Count total detections in previous distance group
+                    prev_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in prev_frames)
+                    
+                    if current_detection_count > prev_detection_count:
+                        # Current has more detections, replace previous
+                        if prev_key in final_filtered_groups:
+                            del final_filtered_groups[prev_key]
+                        final_filtered_groups[current_key] = current_frames
+                    elif current_detection_count == prev_detection_count:
+                        # Equal detection counts, compare confidence scores
+                        current_max_confidence = max(
+                            [detection.get("confidence", 0) for _, frame_data in current_frames 
+                            for detection in frame_data["Detection"]], 
+                            default=0
+                        )
+                        prev_max_confidence = max(
+                            [detection.get("confidence", 0) for _, frame_data in prev_frames 
+                            for detection in frame_data["Detection"]], 
+                            default=0
+                        )
+                        
+                        if current_max_confidence > prev_max_confidence:
+                            # Current has higher confidence, replace previous
+                            if prev_key in final_filtered_groups:
+                                del final_filtered_groups[prev_key]
+                            final_filtered_groups[current_key] = current_frames
+                        # If previous has higher confidence, keep it (do nothing)
+                else:
+                    # Distance is not too close, keep current frame
+                    final_filtered_groups[current_key] = distance_groups[current_key]
+                
+                i += 1
+            
+            # Replace distance_groups with our filtered version
+            distance_groups = final_filtered_groups
+            
+            # Filter out similar detections across different distance groups using IoU
+            self.logger.info("Filtering similar detections across distance groups based on bounding box similarity")
+            
+            def _calculate_bbox_similarity(self, bbox1, bbox2):
+                """Calculate IoU (Intersection over Union) between two bounding boxes"""
+                # Extract coordinates
+                x1_1, y1_1, x2_1, y2_1 = bbox1
+                x1_2, y1_2, x2_2, y2_2 = bbox2
+                
+                # Calculate intersection area
+                x_left = max(x1_1, x1_2)
+                y_top = max(y1_1, y1_2)
+                x_right = min(x2_1, x2_2)
+                y_bottom = min(y2_1, y2_2)
+                
+                # Check if there is an intersection
+                if x_right < x_left or y_bottom < y_top:
+                    return 0.0
+                    
+                intersection_area = (x_right - x_left) * (y_bottom - y_top)
+                
+                # Calculate union area
+                bbox1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+                bbox2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+                union_area = bbox1_area + bbox2_area - intersection_area
+                
+                # Calculate IoU
+                iou = intersection_area / union_area if union_area > 0 else 0.0
+                return iou
+            
+            # Convert method to function for use within this scope
+            calculate_bbox_similarity = lambda bbox1, bbox2: _calculate_bbox_similarity(self, bbox1, bbox2)
+            
+            # Group similar detections across distance groups
+            similarity_groups = []
+            processed_frames = set()
+            
+            # Sort distance groups by distance for consistent processing
+            sorted_distances = sorted(distance_groups.keys(), key=lambda x: float(x))
+            
+            for i, distance1 in enumerate(sorted_distances):
+                group1 = distance_groups[distance1]
+                
+                for frame1_key, frame1_data in group1:
+                    if frame1_key in processed_frames:
+                        continue
+                    
+                    # Create a new similarity group
+                    current_group = [(frame1_key, frame1_data)]
+                    processed_frames.add(frame1_key)
+                    
+                    # Compare with other distance groups
+                    for j in range(i+1, len(sorted_distances)):
+                        distance2 = sorted_distances[j]
+                        group2 = distance_groups[distance2]
+                        
+                        for frame2_key, frame2_data in group2:
+                            if frame2_key in processed_frames:
+                                continue
+                            
+                            # Check if detections are similar using IoU
+                            is_similar = False
+                            
+                            # Compare all detections between the two frames
+                            for detection1 in frame1_data["Detection"]:
+                                for detection2 in frame2_data["Detection"]:
+                                    # Skip if classes are different
+                                    if detection1["class"] != detection2["class"]:
+                                        continue
+                                        
+                                    # Calculate IoU between bounding boxes
+                                    iou = calculate_bbox_similarity(detection1["bbox"], detection2["bbox"])
+                                    
+                                    # If IoU is above threshold, consider them similar
+                                    if iou > 0.6:  # Threshold can be adjusted
+                                        is_similar = True
+                                        break
+                                
+                                if is_similar:
+                                    break
+                            
+                            # If similar, add to current group and mark as processed
+                            if is_similar:
+                                current_group.append((frame2_key, frame2_data))
+                                processed_frames.add(frame2_key)
+                    
+                    # Add the group to similarity groups if it has at least one frame
+                    if current_group:
+                        similarity_groups.append(current_group)
+            
+            # For each similarity group, keep only the frame with highest confidence or most detections
+            optimized_groups = {}
+            
+            for group in similarity_groups:
+                if not group:
+                    continue
+                    
+                # Find the best frame in the group
+                best_frame_key = None
+                best_frame_data = None
+                max_detection_count = -1
+                max_confidence = -1
+                
+                for frame_key, frame_data in group:
+                    # Count detections
+                    detection_count = len(frame_data["Detection"])
+                    
+                    # Calculate average confidence
+                    avg_confidence = sum(d.get("confidence", 0) for d in frame_data["Detection"]) / detection_count if detection_count > 0 else 0
+                    
+                    # Prioritize by detection count, then by confidence
+                    if detection_count > max_detection_count or (detection_count == max_detection_count and avg_confidence > max_confidence):
+                        max_detection_count = detection_count
+                        max_confidence = avg_confidence
+                        best_frame_key = frame_key
+                        best_frame_data = frame_data
+                
+                # Add the best frame to optimized groups
+                if best_frame_key and best_frame_data:
+                    distance = best_frame_data["text_info"]
+                    if distance not in optimized_groups:
+                        optimized_groups[distance] = []
+                    optimized_groups[distance].append((best_frame_key, best_frame_data))
+            
+            # Replace distance_groups with optimized version
+            distance_groups = optimized_groups
+            
+            self.logger.info(f"After similarity filtering: kept {len(distance_groups)} distance groups with {sum(len(group) for group in distance_groups.values())} frames")
+            # Update all_detections with filtered results
+            self.all_detections = {}
+            for distance, frames in distance_groups.items():
+                for frame_key, frame_data in frames:
+                    self.all_detections[frame_key] = frame_data
+            
+            self.logger.info(f"After proximity filtering: kept {len(distance_groups)} distance groups")
+
+        except Exception as e:
+            self.logger.error(f"Error modifying detection base experience: {str(e)}")
+        
 
         # Remove any detections not in filtered groups and their associated frames
-        keys_to_remove = []
-        modifyKeys = [self.all_detections.keys()]
-        OriginalKeys = [self.all_detectionsBaseCopy.keys()]
-
         for key, frame_data in self.all_detectionsBaseCopy.items():
             if key not in self.all_detections:
 
@@ -254,6 +514,10 @@ class BatchDefectDetector:
                 if "frame_path" in frame_data:
                     try:
                         os.remove(frame_data["frame_path"])
+                        base_dir = os.path.dirname(frame_data["frame_path"])
+                        Predictions_dir = os.path.join(base_dir, "predictions_frames")
+                        PredImageName = os.path.join(Predictions_dir, os.path.basename(frame_data["frame_path"]))
+                        os.remove(PredImageName)
                         self.logger.info(f"Removed frame image: {frame_data['frame_path']}")
                     except Exception as e:
                         self.logger.error(f"Error removing frame image {frame_data['frame_path']}: {str(e)}")
@@ -261,7 +525,7 @@ class BatchDefectDetector:
 
     def _collect_frames(self, input_path: str):
         """Collect frames from video file"""
-        self.text_extractor = TextExtractor()
+        
         frames = []  # Initialize frames list
         cap = cv2.VideoCapture(input_path)
         ret, first_frame = cap.read()
@@ -314,7 +578,7 @@ class BatchDefectDetector:
             
             # Update progress for frame extraction stage
             progress = (frame_idx / total_frames) * 100
-            if frame_idx % 5 == 0:
+            if frame_idx % 400 == 0:
                 self.progress_logger.update_stage_progress(
                     "frame extraction",
                     progress,
@@ -371,16 +635,17 @@ class BatchDefectDetector:
             
             # Update progress for AI detection stage
             progress = (current_batch / total_batches) * 100
-            self.progress_logger.update_stage_progress(
-                "Ai detection",
-                progress,
+            if current_batch % 3 == 0:
+                self.progress_logger.update_stage_progress(
+                    "Ai detection",
+                    progress,
                 {
                     "batch": current_batch,
                     "total_batches": total_batches,
                     "batch_time": f"{batch_time:.2f}s",
                     "total_time": f"{total_batch_time:.2f}s"
                 }
-            )
+                )
         
         self.progress_logger.complete_stage(
             "Ai detection",
@@ -432,12 +697,14 @@ class BatchDefectDetector:
                     'timestamp': timestamp,
                     'frame_idx': frame_count
                 })
-        # Save normal frames
-        self._save_detection_frames(frames_dir, Normal_frames)
+
         # Save frames with predictions
         predictions_frames_dir = os.path.join(frames_dir, "predictions_frames")
         os.makedirs(predictions_frames_dir, exist_ok=True)
-        self._save_detection_frames(predictions_frames_dir, frames_with_detections)
+        self._save_detection_frames(predictions_frames_dir, frames_with_detections, _IsNormalFrame=False)
+        # Save normal frames
+        self._save_detection_frames(frames_dir, Normal_frames, _IsNormalFrame=True)
+
         
         self.timing_stats.visualization_time += time.time() - vis_start
 
@@ -458,7 +725,7 @@ class BatchDefectDetector:
             }
             detections.append(detection)
             
-        self.all_detections[f"Image_{frame_count}"] = {"Detection": detections[0]}
+        self.all_detections[f"Image_{frame_count}"] = {"Detection": detections}
 
     def _should_draw_predictions(self):
         """Check if predictions should be drawn on frames"""
@@ -470,18 +737,13 @@ class BatchDefectDetector:
         v = v.draw_instance_predictions(instances)
         return v.get_image()[:, :, ::-1]
 
-    def _save_detection_frames(self, frames_dir, frames_with_detections):
+    def _save_detection_frames(self, frames_dir, frames_with_detections, _IsNormalFrame):
         """Save frames with detections to disk"""
         # Clear existing frames
-        for file in os.listdir(frames_dir):
-            if file.endswith('.jpg'):
-                try:
-                    os.remove(os.path.join(frames_dir, file))
-                except Exception as e:
-                    self.logger.error(f"Error deleting file {file}: {str(e)}")
+        self._clear_existing_frames(frames_dir)
         
         # Save new frames
-        pbar = tqdm(frames_with_detections, desc="Saving detection frames",colour="cyan")
+        pbar = tqdm(frames_with_detections, desc="Saving detection frames", colour="cyan")
         for frame_info in pbar:
             timestamp_str = self._format_timestamp(frame_info['timestamp']).replace(':', '_')
             frame_path = os.path.join(frames_dir, f"frame_{frame_info['frame_idx']}_{timestamp_str}.jpg")
@@ -490,11 +752,26 @@ class BatchDefectDetector:
                 cv2.imwrite(frame_path, frame_info['frame'])
                 self.logger.info(f"Saved detection frame: {frame_path}")
                 
-                image_key = f"Image_{frame_info['frame_idx']}"
-                if image_key in self.all_detections:
-                    self.all_detections[image_key]["frame_path"] = frame_path
+                # Update detection metadata with frame path if needed
+                if _IsNormalFrame:
+                    self._update_detection_metadata(frame_info['frame_idx'], frame_path)
             except Exception as e:
                 self.logger.error(f"Error saving frame {frame_path}: {str(e)}")
+    
+    def _clear_existing_frames(self, frames_dir):
+        """Clear existing jpg frames from the directory"""
+        for file in os.listdir(frames_dir):
+            if file.endswith('.jpg'):
+                try:
+                    os.remove(os.path.join(frames_dir, file))
+                except Exception as e:
+                    self.logger.error(f"Error deleting file {file}: {str(e)}")
+    
+    def _update_detection_metadata(self, frame_idx, frame_path):
+        """Update detection metadata with frame path"""
+        image_key = f"Image_{frame_idx}"
+        if image_key in self.all_detections:
+            self.all_detections[image_key]["frame_path"] = frame_path
 
     def _extract_and_process_text(self, frames):
         """Extract and process text from frames with detections"""
@@ -503,9 +780,8 @@ class BatchDefectDetector:
         
 
         
-        global distance_base
-        distance_base = 0
-        first_frame = True
+        
+        self.distance_base = 0
         distance_means = []
         prev_timestamp = 0
         prev_distance = 0
@@ -513,26 +789,32 @@ class BatchDefectDetector:
         # Sort detections by timestamp
         self.all_detections = dict(sorted(
             self.all_detections.items(),
-            key=lambda item: item[1]["Detection"]["timestamp_seconds"]
+            key=lambda item: item[1]["Detection"][0]["timestamp_seconds"]
         ))
         
         pbar = tqdm(self.all_detections.items(), desc="Processing frame text", colour="cyan")
         total_frames = len(self.all_detections)
         
         for i, (frame_key, frame_data) in enumerate(pbar):
-            self._process_frame_text(
+            result = self._process_frame_text(
                 frame_key, frame_data,
-                first_frame, distance_means,
+                distance_means,
                 prev_timestamp, prev_distance
             )
             
+            # Update first_frame and prev values if needed
+
+            prev_timestamp = result.get('timestamp', prev_timestamp)
+            prev_distance = result.get('distance', prev_distance)
+            
             # Update progress for text extraction stage
             progress = ((i + 1) / total_frames) * 100
-            self.progress_logger.update_stage_progress(
-                "text extraction",
-                progress,
-                {"frames_processed": i + 1, "total_frames": total_frames}
-            )
+            if i % 10 == 0:
+                self.progress_logger.update_stage_progress(
+                    "text extraction",
+                    progress,
+                    {"frames_processed": i + 1, "total_frames": total_frames}
+                )
         self.progress_logger.complete_stage(
             "text extraction",
             {"status": "Text extraction complete"}
@@ -543,15 +825,20 @@ class BatchDefectDetector:
 
 
     def _process_frame_text(self, frame_key, frame_data,
-                           first_frame, distance_means,
+                           distance_means,
                            prev_timestamp, prev_distance):
         """Process text for a single frame"""
-        global distance_base
+        
         self.logger.info(f"Extracting text from frame {frame_key}...")
+        result = {
+            'timestamp': prev_timestamp,
+            'distance': prev_distance
+        }
+        
         try:
             text_info = self.text_extractor.extract_text_from_video_frame(
                 frame_path=frame_data["frame_path"],
-                UseGOTOCR=False
+                UseFullOCR=False
             )
 
             
@@ -559,16 +846,11 @@ class BatchDefectDetector:
                 text_info, frame_data, prev_distance
             )
             
-
-            if first_frame:
-                prev_distance = current_distance
-                prev_timestamp = current_timestamp
-                first_frame = False
                 
             distance_means.append(current_distance)
             mean_distance = mean(distance_means)
             
-            distance_diff = abs(current_distance - distance_base)
+            distance_diff = abs(current_distance - self.distance_base)
             time_diff = current_timestamp - prev_timestamp
             
             frame_data["text_info"] = self._update_distance(
@@ -576,13 +858,15 @@ class BatchDefectDetector:
                 time_diff, frame_data
             )
             
-            prev_timestamp = current_timestamp
-            prev_distance = current_distance
+            result['timestamp'] = current_timestamp
+            result['distance'] = float(frame_data["text_info"])
             self.logger.info(f"Extracted final distance info: {text_info}, first distance: {current_distance}")
             
         except (ValueError, IndexError) as e:
             self.logger.error(f"Error processing text in frame {frame_key}: {str(e)}")
-            frame_data["text_info"] = str(distance_base)
+            frame_data["text_info"] = str(self.distance_base)
+            
+        return result
 
     def _extract_distance_and_timestamp(self, text_info, frame_data, prev_distance):
         """Extract distance and timestamp from text"""
@@ -595,36 +879,67 @@ class BatchDefectDetector:
            (len(text) < len(str(prev_distance)) and '.' not in text):
             text_info = self.text_extractor.extract_text_from_video_frame(
                 frame_path=frame_data["frame_path"],
-                UseGOTOCR=True
+                UseFullOCR=True
             )
 
             text = text_info.split(" ")[0]
             
-        return float(text), frame_data["Detection"]["timestamp_seconds"]
+        return float(text), frame_data["Detection"][0]["timestamp_seconds"]
 
     def _update_distance(self, current_distance, distance_diff,
                         time_diff, frame_data):
-        """Update and validate distance measurement"""
-        global distance_base
-        if ((current_distance >= distance_base or distance_diff < 0.25) and
-            distance_diff <= 2 and time_diff < 20):
-            distance_base = current_distance
-            return str(current_distance)
-        else:
-            text_info = self.text_extractor.extract_text_from_video_frame(
-                frame_path=frame_data["frame_path"],
-                UseGOTOCR=True
-            )
+        """Update and validate distance measurement
+        
+        Args:
+            current_distance (float): The current distance measurement
+            distance_diff (float): Absolute difference from base distance
+            time_diff (float): Time elapsed since previous measurement
+            frame_data (dict): Frame metadata including path
+            
+        Returns:
+            str: Updated distance value as string
+        """
+        # Avoid global variable usage by accessing class attribute instead
+        
+        # Define validation thresholds for distance measurements
+        MAX_DISTANCE_DIFF = 2.0
+        MIN_DISTANCE_DIFF = 0.25
+        MAX_TIME_GAP = 20.0
+        
+        # Check if measurement is valid based on defined thresholds
+        is_valid_measurement = (
+            (current_distance >= self.distance_base or distance_diff < MIN_DISTANCE_DIFF) and
+            distance_diff <= MAX_DISTANCE_DIFF and 
+            time_diff < MAX_TIME_GAP
+        )
+        
+        if is_valid_measurement:
+            # Update base distance if current is greater
+            self.distance_base = max(self.distance_base, current_distance)
+            return str(self.distance_base)
+        
+        # If measurement is invalid, attempt to recover with full OCR
+        text_info = self.text_extractor.extract_text_from_video_frame(
+            frame_path=frame_data["frame_path"],
+            UseFullOCR=True
+        )
+        
+        try:
             text = text_info.split(" ")[0]
-            distance_base = float(text)
-            return str(text)
+            new_distance = float(text)
+            self.distance_base = max(self.distance_base, new_distance)
+            return str(self.distance_base)
+        except (ValueError, IndexError):
+            # Return existing base distance if recovery fails
+            self.logger.debug(f"Failed to extract valid distance from '{text_info}'")
+            return str(self.distance_base)
 
 
     def _save_results(self, output_path):
         """Save detection results to JSON"""
         base_name = os.path.basename(output_path).split("_")[0]
         
-        json_output_path = os.path.join(output_path, base_name + "_detections.json")
+        json_output_path = os.path.join(output_path,  "frames_detections.json")
         with open(json_output_path, 'w') as f:
             json.dump(self.all_detections, f, indent=4)
         self.logger.info(f"Detection data saved to {json_output_path}")
@@ -650,16 +965,23 @@ class BatchDefectDetector:
 
 def main():
     try:
-        # if len(sys.argv) != 2:
-        #     print("Usage: python YourPythonScript.py <video_path>")
-        #     return
+        if len(sys.argv) != 2:
+            print("Usage: python YourPythonScript.py <video_path>")
+            return
 
-        # input_path = sys.argv[1]
-        # if not os.path.isfile(input_path):
-        #     print("Invalid video path provided.")
-        #     return
-        # print(input_path)
+        input_path = sys.argv[1]
+        if not os.path.isfile(input_path):
+            print("Invalid video path provided.")
+            return
+        print(input_path)
 
+        # Get the directory where the current script is located
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+        # Build the path to 'model/v2'
+        model_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'model_final.pth')
+        config_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'mask_rcnn_X_101_32x8d_FPN_3x.yaml')
+        
         config = DetectionConfig(
             class_names=[
                 "Crack", "Obstacle", "Deposits", "Deformed",
@@ -669,23 +991,34 @@ def main():
                 [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
                 [255, 0, 255], [0, 255, 255], [128, 128, 128], [128, 0, 128]
             ],
-            model_path="Model/model_final.pth",
-            config_path="Model/mask_rcnn_X_101_32x8d_FPN_3x.yaml",
+            model_path=model_path,
+            config_path=config_path,
+            batch_size=16
         )
         
         detector = BatchDefectDetector(config)
-        # input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
-        input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
-        output_path = os.path.join("output", os.path.basename(input_path))
-        
-        detector.logger.info(f"Processing video: {input_path}")
-        detector.process_video(input_path, output_path, batch_size=config.batch_size)
-        reporter = ExcelReporter(
-            input_path = os.path.splitext(output_path)[0] + "_frames",
-            excelOutPutName = "Condition-Details.xlsx",
-            progress_logger = detector.progress_logger
-        )
-        reporter.generate_report()
+        detector.text_extractor = TextExtractor()
+
+        #input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
+        # input_pathes = r"C:\\Users\\sobha\\Desktop\\detectron2\\Data\\TestFilm\\Closed circuit television (CCTV) sewer inspection.mp4; C:\\Users\\sobha\\Desktop\\detectron2\\Data\\TestFilm\\8_L1.P27.M283_L1.P27.M284_2018.05.08_D.avi"
+        input_pathes = [path.strip() for path in input_pathes.split(";")]
+
+        for input_path in input_pathes:
+            # Create output path by joining directory and filename using os.path for cross-platform compatibility
+            output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
+            
+            # Ensure output directory exists
+            os.makedirs(output_path, exist_ok=True)
+
+            
+            detector.logger.info(f"Processing video: {input_path}")
+            detector.process_video(input_path, output_path, batch_size=config.batch_size)
+            reporter = ExcelReporter(
+                input_path = output_path,
+                excelOutPutName = "Condition-Details.xlsx",
+                progress_logger = detector.progress_logger
+            )
+            reporter.generate_report()
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         time.sleep(15)

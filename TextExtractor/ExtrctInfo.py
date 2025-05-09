@@ -163,7 +163,7 @@ class TextExtractor:
         text = result[0].replace(" ", "").replace(",", ".")
         return ''.join(c for c in text if c.isdigit() or c == '.')
 
-    def extract_text_from_video_frame(self, frame=None, frame_path=None, save_crop=True, UseGOTOCR=True):
+    def extract_text_from_video_frame(self, frame=None, frame_path=None, save_crop=True, UseFullOCR=True):
         """Extract text from video frame using selected ROI"""
         if frame_path:
             frame = cv2.imread(frame_path)
@@ -185,7 +185,7 @@ class TextExtractor:
         if save_crop:
             Image.fromarray(processed).save("cropped_image.png")
 
-        return (self._extract_text_Complete if UseGOTOCR else self._extract_text_easyocr)(processed)
+        return (self._extract_text_Complete if UseFullOCR else self._extract_text_easyocr)(processed)
 
 
 
