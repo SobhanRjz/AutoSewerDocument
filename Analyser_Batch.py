@@ -59,7 +59,9 @@ class BatchDefectDetector:
         self.timing_stats = TimingStats()
         self.custom_batch = config.custom_batch
         self.all_detections = {}
-        
+        self._setup_progress_logger()
+
+    def _setup_progress_logger(self):
         # Initialize progress logger
         self.progress_logger = ProgressLogger()
         # Initialize stages with their weights
@@ -578,7 +580,7 @@ class BatchDefectDetector:
             
             # Update progress for frame extraction stage
             progress = (frame_idx / total_frames) * 100
-            if frame_idx % 400 == 0:
+            if frame_idx % 800 == 0:
                 self.progress_logger.update_stage_progress(
                     "frame extraction",
                     progress,
@@ -965,16 +967,13 @@ class BatchDefectDetector:
 
 def main():
     try:
-        # if len(sys.argv) != 2:
-        #     print("Usage: python YourPythonScript.py <video_path>")
-        #     return
+        if len(sys.argv) < 2:
+            print("Usage: python YourPythonScript.py <video_path1> <video_path2> ...")
+            return
 
-        # input_path = sys.argv[1]
-        # if not os.path.isfile(input_path):
-        #     print("Invalid video path provided.")
-        #     return
-        # print(input_path)
-
+        input_pathes = sys.argv[1:]
+        print(input_pathes)
+    
         # Get the directory where the current script is located
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -993,17 +992,18 @@ def main():
             ],
             model_path=model_path,
             config_path=config_path,
-            batch_size=16
+            batch_size=32
         )
         
         detector = BatchDefectDetector(config)
         detector.text_extractor = TextExtractor()
 
-        #input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\07- 494 to 493.1\olympic-St25zdo494Surveyupstream.mpg"
-        # input_pathes = r"C:\\Users\\sobha\\Desktop\\detectron2\\Data\\TestFilm\\Closed circuit television (CCTV) sewer inspection.mp4; C:\\Users\\sobha\\Desktop\\detectron2\\Data\\TestFilm\\8_L1.P27.M283_L1.P27.M284_2018.05.08_D.avi"
-        input_pathes = [path.strip() for path in input_pathes.split(";")]
+        # input_pathes is now a list of video paths from command line arguments
 
         for input_path in input_pathes:
+            if not os.path.isfile(input_path):
+                print(f"Invalid video path provided: {input_path}")
+                continue
             # Create output path by joining directory and filename using os.path for cross-platform compatibility
             output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
             
@@ -1012,6 +1012,7 @@ def main():
 
             
             detector.logger.info(f"Processing video: {input_path}")
+            detector._setup_progress_logger()
             detector.process_video(input_path, output_path, batch_size=config.batch_size)
             reporter = ExcelReporter(
                 input_path = output_path,

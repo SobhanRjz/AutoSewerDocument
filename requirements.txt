@@ -1,38 +1,72 @@
-# Data Analysis
-pandas>=2.0.0
-numpy>=1.24.0
 
-# Text Processing
-nltk>=3.8.1
-spacy>=3.7.0
+# =========================
+# Requirements for Project
+# =========================
 
-# Report Generation
-openpyxl>=3.1.0
-python-docx>=1.0.0
-reportlab>=4.0.0
+# --- Data Analysis ---
+pandas
+numpy
 
-# File Handling
-python-magic>=0.4.27
-chardet>=5.2.0
+# --- Text Processing ---
+nltk
+spacy
 
-# Utilities
-tqdm>=4.65.0
-python-dotenv>=1.0.0
+# --- Report Generation ---
+openpyxl
+python-docx
+reportlab
 
-# Testing
-pytest>=7.4.0
-pytest-cov>=4.1.0
+# --- File Handling ---
+python-magic
+chardet
 
-# Computer Vision and Deep Learning
-torch>=2.0.0
-#CUDA >=12.4
-#CUDA version: 12.4
-#PyTorch version: 2.6.0+cu124
+# --- Utilities ---
+tqdm
+python-dotenv
+opencv-python
+opencv-contrib-python
+easyocr
+transformers>=4.41.2
+tiktoken
+verovio
+accelerate
 
-opencv-python>=4.8.0
-detectron2@ git+https://github.com/facebookresearch/detectron2.git
+# --- Testing ---
+pytest
+pytest-cov
+futures
 
-# System and Utilities
-typing-extensions>=4.5.0
-dataclasses>=0.6
-futures>=3.0.5 
+# --- Computer Vision & Deep Learning ---
+# PyTorch and torchvision (CUDA 12.4+ recommended)
+# To install with CUDA 12.4 support:
+#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+# (See https://pytorch.org/get-started/locally/ for other options)
+
+# --- Windows C++ Toolchain (for building some packages) ---
+# 1. Install Visual Studio Build Tools 2022.
+# 2. Select "Desktop development with C++" workload, including:
+#    - MSVC v143 C++ build tools
+#    - Windows 10/11 SDK
+#    - C++ CMake tools for Windows
+#    - (Optional) C++ ATL/MFC, Spectre-mitigated libs
+
+#
+# opencv-python>=4.8.0
+# pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git'
+# remove the condition WITH_CUDA and WITH_HIP in the file detectron2/detectron2/layers/csrc/nms_rotated/nms_rotated_cuda.cu
+# # // Copyright (c) Facebook, Inc. and its affiliates.
+# #include <ATen/ATen.h>
+# #include <ATen/cuda/CUDAContext.h>
+# #include <c10/cuda/CUDAGuard.h>
+# #include <ATen/cuda/CUDAApplyUtils.cuh>
+# //#ifdef WITH_CUDA
+# #include "../box_iou_rotated/box_iou_rotated_utils.h"
+# //#endif
+# // TODO avoid this when pytorch supports "same directory" hipification
+# //#ifdef WITH_HIP
+# #include "box_iou_rotated/box_iou_rotated_utils.h"
+# //#endif
+
+# --- System and Typing Utilities (if needed) ---
+# typing-extensions>=4.5.0
+# dataclasses>=0.6
