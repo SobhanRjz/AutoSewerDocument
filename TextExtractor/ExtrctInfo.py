@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import easyocr
 from PIL import Image
-import pytesseract
+#import pytesseract
 from transformers import AutoModel, AutoTokenizer
 import torchvision.transforms as transforms
 
@@ -18,7 +18,7 @@ class TextExtractor:
         torch.backends.cudnn.benchmark = True
 
         # Initialize Tesseract
-        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+        #pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
         # Initialize EasyOCR
         self.easy_ocr = easyocr.Reader(['en'], gpu=True)
@@ -72,6 +72,7 @@ class TextExtractor:
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         ).to(self.device, non_blocking=True)
 
+        #model.generation_config.cache_implementation = "static"
         model.half()
         model.eval()
         
@@ -159,7 +160,7 @@ class TextExtractor:
         if image.mode != 'RGB':
             image = image.convert('RGB')
 
-        raw_text = self.model.chat(self.tokenizer, image, ocr_type='ocr')
+        raw_text = self.model.chat(self.tokenizer, image, ocr_type='ocr', gradio_input = True)
         return ''.join(c for c in raw_text if c.isdigit() or c == '.')
 
     def _extract_text_easyocr(self, image):
@@ -192,8 +193,8 @@ class TextExtractor:
         cropped = image.crop((x0, y0, x0 + w, y0 + h))
         processed = self._preprocess_image(cropped)
 
-        if save_crop:
-            Image.fromarray(processed).save("cropped_image.png")
+        # if save_crop:
+        #     Image.fromarray(processed).save("cropped_image.png")
 
         return (self._extract_text_Complete if UseFullOCR else self._extract_text_easyocr)(processed)
 

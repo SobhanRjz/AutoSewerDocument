@@ -32,9 +32,21 @@ class ProgressLogger:
 
     def _save_state(self) -> None:
         """Save current state to JSON file"""
-        with self.lock:
-            with open(self.log_file, 'w') as f:
-                json.dump(self.current_state, f, indent=2)
+        max_retries = 2
+        retry_delay = 0.2  # seconds
+        for attempt in range(max_retries):
+            with self.lock:
+                try:
+                    with open(self.log_file, 'w') as f:
+                        json.dump(self.current_state, f, indent=2)
+                    break  # Success, exit the retry loop
+                except Exception as e:
+                    # If file is locked (e.g., by C# UI), wait and retry
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                    else:
+                        # On final failure, pass silently or optionally log somewhere else
+                        pass
 
     def start_process(self, stages: Dict[str, float]) -> None:
         """Start the logging process with defined stages and their weights"""

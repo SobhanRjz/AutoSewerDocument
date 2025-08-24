@@ -2,6 +2,11 @@ import sys
 import os
 import logging
 import torch
+print("PyTorch version:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA device count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("Device name:", torch.cuda.get_device_name(0))
 import detectron2
 from detectron2.utils.logger import setup_logger
 from detectron2.engine import DefaultPredictor
@@ -287,8 +292,8 @@ def main():
 			[128, 128, 128],  # Gray - Surface Damage
 			[128, 0, 128]     # Purple - Root
 		],
-		model_path=os.path.join(r"Model", "model_final.pth"),
-		config_path=os.path.join(r"Model", "mask_rcnn_X_101_32x8d_FPN_3x.yaml")
+		model_path=os.path.join(r"Model", "Model V.2.8.0", "model_final.pth"),
+		config_path=os.path.join(r"Model", "Model V.2.8.0", "mask_rcnn_X_101_32x8d_FPN_3x.yaml")
 	)
 
 	# Initialize detector
@@ -298,7 +303,7 @@ def main():
 	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"
 	#input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\20240610\20240610_104450.AVI"
 	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\14030830\14030830\1104160202120663062-1104160202120663075\1.mpg"
-	input_path = r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\08- 493.1 to 493\olympicSt25zdo4931Surveyupstream.mpg"
+	input_path = r"C:\Projects\AutoSewerDocument\Model\Model V.2.8.0\video\olympicSt25zdo4931Surveyupstream.mpg"
 
 	output_path = os.path.join("output", os.path.basename(input_path))
 	
