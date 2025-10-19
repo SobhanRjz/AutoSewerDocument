@@ -36,6 +36,14 @@ pytest
 pytest-cov
 futures
 
+
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+
+# Your existing dependencies (copy from requirements.txt)
+# Add your existing requirements here...
+
 # --- Computer Vision & Deep Learning ---
 # PyTorch and torchvision (CUDA 12.4+ recommended)
 # To install with CUDA 12.4 support:

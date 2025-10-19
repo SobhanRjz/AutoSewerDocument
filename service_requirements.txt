@@ -1,0 +1,7 @@
+# Service dependencies for AI Sewer Pipe Analyzer
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+requests>=2.28.0
+
+# Your existing dependencies (add from requirements.txt as needed)
