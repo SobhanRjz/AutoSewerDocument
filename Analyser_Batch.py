@@ -50,7 +50,7 @@ class DetectionConfig:
     custom_batch: bool = True
 
 class BatchDefectDetector:
-    def __init__(self, config: DetectionConfig):
+    def __init__(self, config: DetectionConfig, text_extractor=None):
         self._setup_logging()
         self.cfg = self._initialize_config(config)
         self._initialize_model(config)
@@ -59,6 +59,7 @@ class BatchDefectDetector:
         self.timing_stats = TimingStats()
         self.custom_batch = config.custom_batch
         self.all_detections = {}
+        self.text_extractor = text_extractor
         self._setup_progress_logger()
 
     def _setup_progress_logger(self):
@@ -115,13 +116,25 @@ class BatchDefectDetector:
         self.logger.info("Initializing BatchDefectDetector")
 
     def _initialize_model(self, config: DetectionConfig):
-        """Initialize model and related components"""
-        self.model = build_model(self.cfg)
-        DetectionCheckpointer(self.model).load(config.model_path)
-        self.model.eval()
+        print("  Initializing Detectron2 model...")
 
-        if len(self.cfg.DATASETS.TEST):
-            self.metadata = MetadataCatalog.get(self.cfg.DATASETS.TEST[0])
+        # Build model and load weights into *this* model
+        self.model = build_model(self.cfg)
+        self.model.eval()
+        DetectionCheckpointer(self.model).load(self.cfg.MODEL.WEIGHTS)
+
+        # optional warmup (helps first-call latency)
+        with torch.inference_mode():
+            dummy = torch.zeros(3, self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST)
+            dummy_batch = [{
+                "image": dummy.to(self.cfg.MODEL.DEVICE),
+                "height": self.cfg.INPUT.MIN_SIZE_TEST,
+                "width": self.cfg.INPUT.MIN_SIZE_TEST,
+            }]
+            self.model(dummy_batch)
+
+        # keep predictor only if you want single-image path
+        self.predictor = DefaultPredictor(self.cfg)
 
         self.aug = ResizeShortestEdge(
             [self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST],
@@ -129,7 +142,8 @@ class BatchDefectDetector:
         )
         self.input_format = self.cfg.INPUT.FORMAT
         assert self.input_format in ["RGB", "BGR"], self.input_format
-        self.predictor = DefaultPredictor(self.cfg)
+
+        print("  Detectron2 model initialized successfully")
 
     def _setup_dataset(self, class_names: List[str], colors: List[List[int]]) -> None:
         """Setup custom dataset metadata"""
@@ -169,6 +183,13 @@ class BatchDefectDetector:
             
         self.timing_stats.preprocessing_time += time.time() - preprocess_start
         return batch_inputs
+
+    def reset_for_new_video(self):
+        """Reset detector state for processing a new video"""
+        self.all_detections = {}
+        self.timing_stats = TimingStats()
+        self.distance_base = 0
+        self._setup_progress_logger()
 
     def process_video(self, input_path: str, output_path: str, batch_size: int = 8):
         self.progress_logger.complete_stage(
@@ -656,10 +677,9 @@ class BatchDefectDetector:
         return all_predictions, all_frames, all_timestamps
 
     def _predict_batch(self, batch):
-        """Run inference on batch using custom processing"""
         batch_inputs = self.preprocess(batch)
         inference_start = time.time()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(batch_inputs)
         self.timing_stats.inference_time += time.time() - inference_start
         return outputs
@@ -967,6 +987,7 @@ class BatchDefectDetector:
 
 def main():
     try:
+        sys.argv = ["analyser_batch.py", r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\Closed circuit television (CCTV) sewer inspection.mp4"]
         if len(sys.argv) < 2:
             print("Usage: python YourPythonScript.py <video_path1> <video_path2> ...")
             return
@@ -992,28 +1013,30 @@ def main():
             ],
             model_path=model_path,
             config_path=config_path,
-            batch_size=32
+            batch_size=16
         )
         
-        detector = BatchDefectDetector(config)
-        detector.text_extractor = TextExtractor()
+        # Load all models once with optimizations
+        print("Loading TextExtractor models (EasyOCR + GOT-OCR) with async loading and caching...")
+        text_extractor = TextExtractor(lazy_load=True, use_cache=True)  # Use async loading and caching for better UX
+        print("Loading detection model...")
+        detector = BatchDefectDetector(config, text_extractor)
 
-        # input_pathes is now a list of video paths from command line arguments
+        print(f"Model cache size: {TextExtractor.get_cache_size()} instances")
 
+        # Process all videos with pre-loaded models
         for input_path in input_pathes:
             if not os.path.isfile(input_path):
                 print(f"Invalid video path provided: {input_path}")
                 continue
-            # Create output path by joining directory and filename using os.path for cross-platform compatibility
-            output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
             
-            # Ensure output directory exists
+            output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
             os.makedirs(output_path, exist_ok=True)
 
-            
             detector.logger.info(f"Processing video: {input_path}")
-            detector._setup_progress_logger()
+            detector.reset_for_new_video()
             detector.process_video(input_path, output_path, batch_size=config.batch_size)
+            
             reporter = ExcelReporter(
                 input_path = output_path,
                 excelOutPutName = "Condition-Details.xlsx",
