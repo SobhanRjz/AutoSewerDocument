@@ -7,6 +7,7 @@ import time
 import json
 import math
 import numpy as np
+import subprocess
 from typing import List, Dict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
@@ -547,58 +548,191 @@ class BatchDefectDetector:
 
 
     def _collect_frames(self, input_path: str):
-        """Collect frames from video file"""
-        
-        frames = []  # Initialize frames list
+        """Collect frames from video file using FFmpeg with hardware acceleration"""
+
+        self.logger.info("Starting fast frame collection with FFmpeg...")
+        frame_collection_start = time.time()
+
+        # Get first frame for ROI selection (text extractor needs this)
         cap = cv2.VideoCapture(input_path)
         ret, first_frame = cap.read()
         if ret:
-            frames.append(first_frame)
             self.text_extractor._get_user_roi(first_frame)
-        
+        # cap.release()
+
         if not cap.isOpened():
             self.logger.error(f"Error opening video file {input_path}")
             return [], []
-            
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        frame_interval = fps
-        
-        frames_to_process = []
-        timestamps_to_process = []
-        frame_queue = Queue()
-        
-        self.logger.info("Starting frame collection...")
-        frame_collection_start = time.time()
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.submit(self._read_frames, cap, total_frames, frame_interval, frame_queue)
-            executor.submit(self._process_frame_queue, frame_queue, frames_to_process, timestamps_to_process, fps)
-            
+
+        # Use FFmpeg for fast frame extraction with downsampling
+        target_fps = 1  # Downsample to 1 FPS for efficiency
+
+        # Calculate target dimensions once (shared between FFmpeg and OpenCV)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        #target_width, target_height = self._calculate_target_dimensions(w, h)
+        target_width, target_height = w, h
+        try:
+            frames_to_process, timestamps_to_process = self._collect_frames_ffmpeg(
+                input_path, target_fps=target_fps, width=target_width, height=target_height
+            )
+        except RuntimeError as e:
+            self.logger.warning(f"FFmpeg frame extraction failed: {e}")
+            self.logger.info("Falling back to OpenCV frame extraction...")
+            # Fallback to OpenCV method with same target dimensions
+            frames_to_process, timestamps_to_process = self._collect_frames_opencv(
+                input_path, target_width=target_width, target_height=target_height
+            )
+
         self.timing_stats.frame_collection_time = time.time() - frame_collection_start
-        self.logger.info(f"Frame collection complete. Total frames: {len(frames_to_process)}. "
+        self.logger.info(f"FFmpeg frame collection complete. Total frames: {len(frames_to_process)}. "
                         f"Time taken: {self.timing_stats.frame_collection_time:.2f}s")
-        
+
         self.progress_logger.complete_stage(
             "frame extraction",
             {"status": "Frame collection complete"}
         )
-                        
 
         return frames_to_process, timestamps_to_process
 
-    def _read_frames(self, cap, total_frames, frame_interval, frame_queue):
-        """Read frames from video capture"""
+    def _collect_frames_ffmpeg(self, path, target_fps=1, width=None, height=None):
+        """Fast frame collection using FFmpeg with hardware acceleration and downsampling"""
+        # Pick best hwaccel
+        def try_cmd(hw=None):
+            vf = [f"fps={target_fps}"]
+            if width and height:
+                # scale on GPU when possible; otherwise CPU scale is fine
+                if hw == "cuda":
+                    vf.append(f"scale_cuda={width}:{height}")
+                else:
+                    vf.append(f"scale={width}:{height}")
+            vf = ",".join(vf)
+
+            base = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+            if hw == "cuvid":
+                # Most reliable NVIDIA hwaccel
+                base += ["-hwaccel", "cuvid", "-c:v", "h264_cuvid"]
+            elif hw == "cuda":
+                # Alternative NVIDIA hwaccel
+                base += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            elif hw == "d3d11va":
+                # Intel/AMD hwaccel
+                base += ["-hwaccel", "d3d11va"]
+            # hw == None uses CPU (no hwaccel flags)
+            base += ["-i", path, "-vf", vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+            return base
+
+        # Figure out output size (use provided dimensions or get from video)
+        if width is None or height is None:
+            cap = cv2.VideoCapture(path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if width is None else width
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if height is None else height
+            cap.release()
+        else:
+            w, h = width, height
+
+        frame_bytes = w * h * 3
+
+        # Try hardware acceleration in order of reliability: cuvid > cuda > d3d11va > cpu
+        hw_options = []
+        if torch.cuda.is_available():
+            hw_options.extend(["cuvid", "cuda"])  # cuvid is more reliable than cuda
+        hw_options.extend(["d3d11va", None])  # d3d11va for Intel/AMD, None for CPU fallback
+
+        for hw in hw_options:
+            try:
+                self.logger.info(f"Trying FFmpeg with hwaccel: {hw or 'cpu'}")
+                p = subprocess.Popen(try_cmd(hw), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                frames, ts = [], []
+                i = 0
+                read = p.stdout.read
+                while True:
+                    buf = read(frame_bytes)
+                    if not buf or len(buf) < frame_bytes:
+                        break
+                    frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+                    frames.append(frame)
+                    ts.append(i/float(target_fps))
+                    i += 1
+                p.stdout.close()
+                p.wait()
+
+                if p.returncode == 0 and len(frames) > 0:
+                    self.logger.info(f"Successfully collected {len(frames)} frames using {hw or 'cpu'} hwaccel")
+                    return frames, ts
+                else:
+                    # Get stderr for debugging
+                    stderr_output = p.stderr.read().decode('utf-8', errors='ignore') if p.stderr else ""
+                    self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed (exit code: {p.returncode})")
+                    if stderr_output:
+                        # Show first 300 chars of error
+                        error_preview = stderr_output[:300] + "..." if len(stderr_output) > 300 else stderr_output
+                        self.logger.warning(f"FFmpeg stderr: {error_preview}")
+                    else:
+                        self.logger.warning("No stderr output from FFmpeg")
+            except Exception as e:
+                self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed: {e}")
+                continue  # try next hwaccel
+
+        raise RuntimeError("FFmpeg frame extraction failed with all hardware acceleration options.")
+
+    def _calculate_target_dimensions(self, original_width: int, original_height: int) -> tuple[int, int]:
+        """Calculate target dimensions for frame processing with intelligent downscaling"""
+        # Downscale large videos for better performance (sewer videos don't need 1080p)
+        # Most sewer inspection videos are 720p or smaller, but handle 1080p gracefully
+        if original_height > 720:
+            target_height = 720
+            target_width = int(original_width * 720 / original_height)  # Maintain aspect ratio
+            self.logger.info(f"Downscaling from {original_width}x{original_height} to {target_width}x{target_height} for performance")
+        else:
+            target_width, target_height = original_width, original_height
+
+        return target_width, target_height
+
+    def _collect_frames_opencv(self, input_path: str, target_width: int = None, target_height: int = None):
+        """Fallback frame collection using OpenCV (slower but reliable)"""
+        frames_to_process = []
+        timestamps_to_process = []
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            self.logger.error(f"Error opening video file {input_path}")
+            return [], []
+
+        # Get original dimensions
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        frame_interval = fps  # Extract 1 frame per second
+
+        # Use provided target dimensions or calculate them
+        if target_width is None or target_height is None:
+            target_w, target_h = self._calculate_target_dimensions(orig_w, orig_h)
+        else:
+            target_w, target_h = target_width, target_height
+            self.logger.info(f"OpenCV fallback: Using provided dimensions {target_w}x{target_h}")
+
         frame_idx = 0
-        pbar = tqdm(total=total_frames, desc="Reading frames",colour="cyan")
+        pbar = tqdm(total=total_frames, desc="Reading frames (fallback)", colour="cyan")
+
         while frame_idx < total_frames:
             ret, frame = cap.read()
             if not ret:
                 break
+
             if frame_idx % frame_interval == 0:
-                frame_queue.put((frame_idx, frame))
+                # Resize frame to target dimensions if needed
+                current_shape = frame.shape[:2]  # (height, width)
+                if current_shape != (target_h, target_w):
+                    frame = cv2.resize(frame, (target_w, target_h))
+
+                frames_to_process.append(frame)
+                timestamps_to_process.append(frame_idx / fps)
+
             frame_idx += 1
             pbar.update(1)
-            
+
             # Update progress for frame extraction stage
             progress = (frame_idx / total_frames) * 100
             if frame_idx % 800 == 0:
@@ -607,18 +741,12 @@ class BatchDefectDetector:
                     progress,
                     {"frames_processed": frame_idx, "total_frames": total_frames}
                 )
-        frame_queue.put(None)
-        pbar.close()
 
-    def _process_frame_queue(self, frame_queue, frames_to_process, timestamps_to_process, fps):
-        """Process frames from queue"""
-        while True:
-            item = frame_queue.get()
-            if item is None:
-                break
-            frame_idx, frame = item
-            frames_to_process.append(frame)
-            timestamps_to_process.append(frame_idx / fps)
+        pbar.close()
+        cap.release()
+
+        self.logger.info(f"OpenCV fallback collected {len(frames_to_process)} frames")
+        return frames_to_process, timestamps_to_process
 
     def _process_batches(self, frames, timestamps, batch_size):
         """Process frames in batches"""
@@ -987,7 +1115,7 @@ class BatchDefectDetector:
 
 def main():
     try:
-        sys.argv = ["analyser_batch.py", r"C:\Users\sobha\Desktop\detectron2\Code\Auto_Sewer_Document\output\Closed circuit television (CCTV) sewer inspection.mp4"]
+        sys.argv = ["analyser_batch.py", r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"]
         if len(sys.argv) < 2:
             print("Usage: python YourPythonScript.py <video_path1> <video_path2> ...")
             return

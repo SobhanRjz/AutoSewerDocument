@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
         set_progress("initialization", 30.0, {"status": "Loading OCR models..."})
 
         # Load OCR models (with caching for faster subsequent runs)
-        text_extractor = TextExtractor(lazy_load=True, use_cache=True)
+        text_extractor = TextExtractor(use_cache=True)
 
         set_progress("initialization", 70.0, {"status": "Loading detection model..."})
 

@@ -66,7 +66,7 @@ curl -X POST http://127.0.0.1:8766/clear_cache
 
 - **Models loaded once** on startup, reused for all videos
 - **OCR model caching** - subsequent runs are near-instantaneous
-- **Async model loading** - loads multiple models in parallel
+- **FFmpeg hardware decoding** - fastest frame extraction on Windows
 - **Progress tracking** - maintains `progress_log.json` for UI compatibility
 
 ### 🛡️ Production Ready
@@ -196,6 +196,7 @@ python service.py
 **Why faster?**
 - Models loaded once instead of 10 times
 - OCR caching eliminates repeat loading
+- **FFmpeg hardware decoding** extracts frames 5-10x faster than OpenCV
 - Parallel processing where possible
 - No Python startup overhead per video
 

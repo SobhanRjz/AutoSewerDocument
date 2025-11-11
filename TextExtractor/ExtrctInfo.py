@@ -364,6 +364,8 @@ class TextExtractor:
         
         x0, y0, w, h = self.roi_coords
         cropped = image.crop((x0, y0, x0 + w, y0 + h))
+        # Save the cropped ROI as a PNG for debugging/inspection
+        # cropped.save("selected_roi.png")
         processed = self._preprocess_image(cropped)
 
         # if save_crop:

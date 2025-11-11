@@ -81,11 +81,17 @@ class ExcelReporter:
 
     def write_data_rows(self, json_data: Dict) -> None:
         """Write and style data rows"""
-        total_rows = len(json_data)
+        # Sort data by timestamp to ensure chronological order in Excel
+        sorted_data = dict(sorted(
+            json_data.items(),
+            key=lambda item: item[1].get("Detection", [{}])[0].get("timestamp_seconds", 0)
+        ))
+
+        total_rows = len(sorted_data)
         row_num = 2
 
         try:
-            for _, (image_key, entry) in enumerate(json_data.items(), 0):
+            for _, (image_key, entry) in enumerate(sorted_data.items(), 0):
                 # Update progress for excel reporting stage
                 progress = ((row_num - 1) / total_rows) * 100
                 if row_num % 10 == 0:
