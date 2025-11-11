@@ -192,3 +192,5 @@ output/olympicSt25zdo4931Surveyupstream.mpg
 *.onnx
 test_cache/predictions_cache.pkl
 test_cache/frames_cache.pkl
+output/
+*.mp4
