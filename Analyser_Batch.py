@@ -28,6 +28,8 @@ from detectron2.data.transforms import ResizeShortestEdge
 from TextExtractor.ExtrctInfo import TextExtractor
 from Reporter.ExcelReporter import ExcelReporter
 from utils.logger import ProgressLogger
+from FewShotClassifier import RootClassifier
+from PipeCoverage import PipeRimDetector, MultiClassCoverageAnalyzer
 
 
 @dataclass
@@ -62,6 +64,7 @@ class BatchDefectDetector:
         self.all_detections = {}
         self.text_extractor = text_extractor
         self._setup_progress_logger()
+        self._initialize_few_shot_classifier()
 
     def _setup_progress_logger(self):
         # Initialize progress logger
@@ -82,6 +85,23 @@ class BatchDefectDetector:
             80.0,
             {"status": "Setting up detector configuration"}
         )
+    
+    def _initialize_few_shot_classifier(self):
+        """Initialize root type classifier for few-shot detection."""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, "Model", "MiniModel", "Root", "model.pth")
+        support_set_dir = os.path.join(base_dir, "Model", "MiniModel", "Root", "Support_Set")
+        
+        try:
+            self.root_classifier = RootClassifier(
+                model_path=model_path,
+                support_set_dir=support_set_dir,
+                device=self.cfg.MODEL.DEVICE
+            )
+            self.logger.info("Root classifier initialized successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize root classifier: {e}")
+            self.root_classifier = None
 
     def _setup_logging(self):
         """Configure logging with detailed format"""
@@ -151,6 +171,26 @@ class BatchDefectDetector:
         MetadataCatalog.get("custom_dataset").set(thing_classes=class_names)
         self.metadata = MetadataCatalog.get("custom_dataset")
         self.metadata.thing_colors = colors
+        
+        # Initialize pipe coverage analyzer now that we have class names
+        try:
+            self.rim_detector = PipeRimDetector(
+                edge_low=50,
+                edge_high=150,
+                min_radius=400,
+                max_radius=900,
+                ransac_iterations=5000,
+                ransac_threshold=5.0,
+                temporal_alpha=0.7,
+                use_hough=True,
+                blur_kernel=5
+            )
+            self.coverage_analyzer = MultiClassCoverageAnalyzer(class_names, theta_bins=360)
+            self.logger.info("Pipe coverage analyzer initialized successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize coverage analyzer: {e}")
+            self.rim_detector = None
+            self.coverage_analyzer = None
 
     def _initialize_config(self, config: DetectionConfig):
         """Initialize Detectron2 configuration"""
@@ -205,11 +245,11 @@ class BatchDefectDetector:
         
         # Process frames in batches
         all_predictions, all_frames, all_timestamps = self._process_batches(
-            frames_to_process, 
+            frames_to_process,
             timestamps_to_process,
             batch_size
         )
-        
+
         # Visualize and save results
         frames_dir = os.path.join(output_path, "frames")
         os.makedirs(frames_dir, exist_ok=True)
@@ -221,6 +261,10 @@ class BatchDefectDetector:
 
         self._extract_and_process_text(all_frames)
         self.modify_detection_baseExperience()
+
+        # Apply few-shot classification to root detections after filtering
+        self._classify_root_detections(all_frames, all_predictions)
+
         self._save_results(output_path)
         self._log_timing_stats(process_start)
 
@@ -803,6 +847,182 @@ class BatchDefectDetector:
             {"status": "AI detection complete"}
         )
         return all_predictions, all_frames, all_timestamps
+    
+    def _classify_root_detections(self, frames, predictions):
+        """Apply few-shot classification to Root detections after filtering using full frames.
+
+        Args:
+            frames: List of frame images
+            predictions: List of prediction outputs from model
+        """
+        if self.root_classifier is None or not self.root_classifier.is_loaded():
+            self.logger.warning("Root classifier not available, skipping few-shot classification")
+            return
+
+        self.logger.info("Applying few-shot classification to remaining Root detections using full frames...")
+        root_class_idx = self.metadata.thing_classes.index("Root")
+        classified_count = 0
+
+        # Only process frames that remain after filtering
+        for frame_key, frame_data in self.all_detections.items():
+            if "Detection" not in frame_data:
+                continue
+
+            # Extract frame index from key (e.g., "Image_1" -> 0)
+            frame_idx = int(frame_key.split("_")[1]) - 1
+
+            if frame_idx >= len(frames) or frame_idx >= len(predictions):
+                continue
+
+            frame = frames[frame_idx]
+            output = predictions[frame_idx]
+
+            if not self.custom_batch:
+                instances = output["instances"]
+            else:
+                instances = output["instances"]
+
+            instances = instances.to("cpu")
+
+            if len(instances) == 0:
+                continue
+
+            boxes = instances.pred_boxes.tensor.numpy()
+            classes = instances.pred_classes.numpy()
+
+            # Get Root detections in this frame
+            root_detections = [(i, box) for i, (box, class_id) in enumerate(zip(boxes, classes))
+                             if class_id == root_class_idx]
+
+            for det_idx, box in root_detections:
+                # Use full frame for root classification instead of cropping
+                # Save full frame image temporarily
+                temp_dir = "temp_crops"
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_filename = os.path.join(temp_dir, f"full_frame_{frame_idx}_det_{det_idx}.jpg")
+                cv2.imwrite(temp_filename, frame)
+
+                try:
+                    result = self.root_classifier.predict(frame)
+
+                    # Update the stored detection with subclass info
+                    if det_idx < len(frame_data["Detection"]):
+                        frame_data["Detection"][det_idx]["root_subclass"] = result["class"]
+                        frame_data["Detection"][det_idx]["root_subclass_confidence"] = float(result["confidence"])
+
+                        # If classified as "mass", calculate pipe coverage
+                        if result["class"].lower() == "mass" and self.rim_detector and self.coverage_analyzer:
+                            try:
+                                coverage_info = self._calculate_mass_coverage(
+                                    frame, instances, det_idx, classes, frame_idx
+                                )
+                                if coverage_info:
+                                    frame_data["Detection"][det_idx]["angular_coverage_pct"] = coverage_info["angular_pct"]
+                                    frame_data["Detection"][det_idx]["area_coverage_pct"] = coverage_info["area_pct"]
+                                    self.logger.info(
+                                        f"Frame {frame_key}: Mass coverage - Angular: {coverage_info['angular_pct']:.1f}%, "
+                                        f"Area: {coverage_info['area_pct']:.1f}%"
+                                    )
+                            except Exception as cov_err:
+                                self.logger.error(f"Failed to calculate coverage for mass in {frame_key}: {cov_err}")
+
+                        # Also update instances for consistency
+                        if not hasattr(instances, 'root_subclass'):
+                            instances.root_subclass = [None] * len(instances)
+                            instances.root_confidence = [None] * len(instances)
+
+                        instances.root_subclass[det_idx] = result["class"]
+                        instances.root_confidence[det_idx] = result["confidence"]
+
+                        classified_count += 1
+
+                        self.logger.info(
+                            f"Frame {frame_key}: Root classified as {result['class']} "
+                            f"(conf: {result['confidence']:.3f})"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Failed to classify root in {frame_key}: {e}")
+
+        self.logger.info(f"Classified {classified_count} root detections using full frames after filtering")
+
+    def _calculate_mass_coverage(self, frame, instances, det_idx, classes, frame_idx=None):
+        """Calculate angular and area coverage for mass root detection."""
+        try:
+            # Detect pipe rim
+            rim = self.rim_detector.detect(frame)
+            if rim is None:
+                self.logger.warning("Rim detection failed for mass coverage calculation")
+                return None
+            
+            # Get masks from instances
+            if not hasattr(instances, 'pred_masks') or len(instances.pred_masks) <= det_idx:
+                self.logger.warning("No mask available for mass detection")
+                return None
+            
+            # Get class names from metadata
+            class_names = self.metadata.thing_classes
+            
+            # Convert instance masks to class masks
+            h, w = frame.shape[:2]
+            class_masks = {cls: np.zeros((h, w), dtype=np.uint8) for cls in class_names}
+            
+            # Fill in the mask for this specific detection
+            mask = instances.pred_masks[det_idx].numpy().astype(np.uint8) * 255
+            class_id = int(classes[det_idx])
+            if class_id < len(class_names):
+                class_masks[class_names[class_id]] = mask
+            
+            # Analyze coverage
+            coverage = self.coverage_analyzer.analyze(frame, class_masks, rim)
+            
+            # Get the coverage for this specific class
+            class_name = class_names[class_id] if class_id < len(class_names) else None
+            if class_name and class_name in coverage.per_class:
+                angular_pct = coverage.per_class[class_name].angular_coverage.coverage_percentage
+                area_pct = coverage.per_class[class_name].angular_coverage.area_coverage_percentage
+                
+                self._visualize_mass_coverage(frame, coverage, rim, class_masks, angular_pct, area_pct, frame_idx, det_idx)
+                return {
+                    "angular_pct": float(angular_pct),
+                    "area_pct": float(area_pct)
+                }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error in _calculate_mass_coverage: {e}")
+            return None
+    
+    def _visualize_mass_coverage(self, frame, coverage, rim, class_masks, 
+                                 angular_pct, area_pct, frame_idx, det_idx):
+        """Draw rim circle and coverage metrics on frame and save."""
+        try:
+            # Create visualization
+            vis = self.coverage_analyzer.visualize(frame, coverage, rim, class_masks, show_per_class=True)
+            
+            # Draw additional coverage info
+            cx, cy, r = int(rim.center_x), int(rim.center_y), int(rim.radius)
+            
+            # Draw rim circle in yellow
+            cv2.circle(vis, (cx, cy), r, (0, 255, 255), 3)
+            cv2.circle(vis, (cx, cy), 7, (0, 255, 255), -1)
+            
+            # Add large text at bottom showing both metrics
+            text_y = vis.shape[0] - 60
+            cv2.putText(vis, f"MASS COVERAGE", (10, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+            cv2.putText(vis, f"Angular: {angular_pct:.1f}%  |  Area: {area_pct:.1f}%", 
+                       (10, text_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            
+            # Save visualization
+            output_dir = "mass_coverage_output"
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f"mass_coverage_frame_{frame_idx}_det_{det_idx}.jpg")
+            cv2.imwrite(output_path, vis)
+            self.logger.info(f"Saved mass coverage visualization: {output_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Error visualizing mass coverage: {e}")
 
     def _predict_batch(self, batch):
         batch_inputs = self.preprocess(batch)
@@ -864,8 +1084,11 @@ class BatchDefectDetector:
         scores = instances.scores.numpy()
         classes = instances.pred_classes.numpy()
         
+        root_subclasses = getattr(instances, 'root_subclass', [None] * len(instances))
+        root_confidences = getattr(instances, 'root_confidence', [None] * len(instances))
+        
         detections = []
-        for box, score, class_id in zip(boxes, scores, classes):
+        for idx, (box, score, class_id) in enumerate(zip(boxes, scores, classes)):
             detection = {
                 "bbox": box.tolist(),
                 "class": self.metadata.thing_classes[class_id],
@@ -873,6 +1096,11 @@ class BatchDefectDetector:
                 "frame_time": time.time(),
                 "timestamp_seconds": timestamp
             }
+            
+            if self.metadata.thing_classes[class_id] == "Root" and root_subclasses[idx]:
+                detection["root_subclass"] = root_subclasses[idx]
+                detection["root_subclass_confidence"] = float(root_confidences[idx])
+            
             detections.append(detection)
             
         self.all_detections[f"Image_{frame_count}"] = {"Detection": detections}
@@ -1141,7 +1369,7 @@ def main():
             ],
             model_path=model_path,
             config_path=config_path,
-            batch_size=16
+            batch_size=4
         )
         
         # Load all models once with optimizations

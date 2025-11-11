@@ -190,3 +190,5 @@ output/olympicSt25zdo4931Surveyupstream.mpg
 *.pt
 *.pth
 *.onnx
+test_cache/predictions_cache.pkl
+test_cache/frames_cache.pkl
