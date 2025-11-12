@@ -54,7 +54,7 @@ class PipeRimDetector:
         use_search_band: bool = True,
         use_frst_center: bool = True,
         pyramid_scale: float = 0.5,
-        confidence_threshold: float = 0.8,
+        confidence_threshold: float = 0.9,
         max_gradient_points: int = 5000
     ):
         """
@@ -75,7 +75,7 @@ class PipeRimDetector:
             use_search_band: Use temporal search band to reduce noise
             use_frst_center: Use Fast Radial Symmetry Transform for center detection
             pyramid_scale: Scale for image pyramid (0.5 = 4x speedup)
-            confidence_threshold: Skip heavy ops if confidence above this
+            confidence_threshold: Skip heavy ops if confidence above this (default 0.9)
             max_gradient_points: Max points for gradient refinement (cap memory)
         """
         self._edge_low = edge_low
@@ -206,7 +206,8 @@ class PipeRimDetector:
             return self._prev_rim
 
         # Skip expensive refinement for high-confidence Hough results
-        needs_refinement = not (rim.confidence >= 0.8 and hasattr(rim, 'confidence'))
+        rim_confidence = getattr(rim, "confidence", 0.0) or 0.0
+        needs_refinement = rim_confidence < self._confidence_threshold
 
         # Apply gradient refinement only if needed
         if self._use_gradient_refinement and not rim.is_ellipse and needs_refinement:
