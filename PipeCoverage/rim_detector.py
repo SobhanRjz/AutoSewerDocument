@@ -245,10 +245,14 @@ class PipeRimDetector:
         return gray
     
     def _auto_canny(self, gray: np.ndarray) -> np.ndarray:
-        """Adaptive Canny edge detection based on median intensity."""
+        """Adaptive Canny edge detection with improved thresholds."""
         v = np.median(gray)
-        low = int(max(0, 0.66 * v))
-        high = int(min(255, 1.33 * v))
+        # More sensitive thresholds to catch weak edges
+        low = int(max(0, 0.5 * v))
+        high = int(min(255, 1.5 * v))
+        # Ensure minimum separation for edge detection
+        if high - low < 30:
+            high = min(255, low + 30)
         return cv2.Canny(gray, low, high)
     
     def _apply_search_band(self, edges: np.ndarray, prev_rim: PipeRim) -> np.ndarray:
@@ -257,8 +261,8 @@ class PipeRimDetector:
         yy, xx = np.ogrid[:h, :w]
         dist = np.sqrt((xx - prev_rim.center_x)**2 + (yy - prev_rim.center_y)**2)
 
-        # Temporal band tightening: ±10% when stable, ±15% when unstable
-        band_width = 0.10 if self._stable_frames >= 5 else 0.15
+        # Temporal band: ±15% when stable, ±20% when unstable (more tolerant)
+        band_width = 0.15 if self._stable_frames >= 5 else 0.20
         inner = prev_rim.radius * (1 - band_width)
         outer = prev_rim.radius * (1 + band_width)
 
@@ -303,8 +307,8 @@ class PipeRimDetector:
         # Gradient alignment score (should point outward from center)
         alignment = (gx_pts * dx + gy_pts * dy) / (mag_pts * np.sqrt(dx*dx + dy*dy) + 1e-6)
         
-        # Keep only points with outward-pointing gradients
-        valid = alignment > 0.3
+        # Keep only points with outward-pointing gradients (relaxed threshold)
+        valid = alignment > 0.2
         if not np.any(valid):
             return cx, cy
         
@@ -425,12 +429,12 @@ class PipeRimDetector:
             roi_s = cv2.medianBlur(roi_s, 5)
 
             # faster accumulator: dp > 1, and large minDist so we don't get tons of near-duplicate circles
-            dp = 1.4
+            dp = 1.2  # More precise accumulator
             minDist = max(10, int(0.8 * (r * scale)))  # big enough to avoid cluster of centers
-            # param2 higher => fewer candidates => faster; refine radius later if you need
+            # Lower param1/param2 for better sensitivity to weak edges
             circles = cv2.HoughCircles(
                 roi_s, cv2.HOUGH_GRADIENT, dp, minDist,
-                param1=120, param2=50, minRadius=minR_s, maxRadius=maxR_s
+                param1=80, param2=35, minRadius=minR_s, maxRadius=maxR_s
             )
 
             if circles is not None:
@@ -455,11 +459,12 @@ class PipeRimDetector:
             minR_s, maxR_s = self._min_radius, self._max_radius
 
         g_s = cv2.medianBlur(g_s, 5)
-        dp = 1.5                               # smaller accumulator -> faster
+        dp = 1.3  # More precise accumulator
         minDist = max(20, int(0.4 * min(h, w) * scale))  # avoid many candidates
+        # Lower param1/param2 for better sensitivity
         circles = cv2.HoughCircles(
             g_s, cv2.HOUGH_GRADIENT, dp, minDist,
-            param1=120, param2=55, minRadius=minR_s, maxRadius=maxR_s
+            param1=80, param2=40, minRadius=minR_s, maxRadius=maxR_s
         )
         if circles is None:
             return None
@@ -536,16 +541,16 @@ class PipeRimDetector:
             if r >= border_margin:
                 continue
 
-            # Contrast sign: outer must be brighter than inner by at least 8
-            if contrast <= 8:
+            # Contrast sign: outer must be brighter than inner (relaxed for low-contrast scenes)
+            if contrast <= 3:
                 continue
 
-            # Angle coverage weighting: stricter threshold for occluded scenes
-            if coverage < 0.45:
+            # Angle coverage: relaxed for partially occluded pipes
+            if coverage < 0.30:
                 continue
 
-            if outward_ratio < 0.55:
-                continue  # reject inner/shadow rings
+            if outward_ratio < 0.40:
+                continue  # reject inner/shadow rings (relaxed threshold)
 
             if score > best_score:
                 best_score = score
@@ -553,13 +558,26 @@ class PipeRimDetector:
 
         return best  # or None
 
-    def _frst_center(self, gray, radii=(7, 9, 11), alpha=2.0, thresh=85):
-        """Fast Radial Symmetry Transform for center detection (~40 lines)."""
+    def _frst_center(self, gray, radii=None, alpha=2.0, thresh=80):
+        """Fast Radial Symmetry Transform for center detection with adaptive radii."""
         g = gray if gray.dtype==np.uint8 else cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+        
+        # Adaptive radii based on expected pipe size
+        if radii is None:
+            expected_r = (self._min_radius + self._max_radius) / 2
+            # Use radii proportional to expected pipe size (for gradient backprojection)
+            base_radii = [5, 7, 9, 11]
+            if expected_r > 500:
+                radii = [r * 2 for r in base_radii]
+            elif expected_r > 300:
+                radii = [int(r * 1.5) for r in base_radii]
+            else:
+                radii = base_radii
+        
         gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
         mag = cv2.magnitude(gx, gy)
-        T = np.percentile(mag, thresh)
+        T = np.percentile(mag, thresh)  # Lower threshold for more edge points
         edgemask = mag > T
 
         h,w = g.shape
@@ -567,6 +585,10 @@ class PipeRimDetector:
         M = np.zeros((h,w), np.float32)   # magnitude votes
 
         ys, xs = np.where(edgemask)
+        if len(ys) == 0:
+            # Fallback to center if no edges
+            return float(w/2), float(h/2)
+        
         vx = gx[ys, xs] / (mag[ys, xs] + 1e-6)
         vy = gy[ys, xs] / (mag[ys, xs] + 1e-6)
 
@@ -599,10 +621,10 @@ class PipeRimDetector:
         rad = (r0 + idx).astype(np.int32)            # per-angle peak radii
         stren = band[idx, np.arange(band.shape[1])]
 
-        # keep only strong angles
-        thr = np.percentile(stren, 70.0)
+        # keep only strong angles (lower threshold for better detection)
+        thr = np.percentile(stren, 60.0)
         rad_v = rad[stren >= thr]
-        if rad_v.size < 50:
+        if rad_v.size < 30:  # Lower minimum requirement
             return float(np.median(rad))
 
         # ---- NEW: find the dominant radius mode and ignore outliers
@@ -611,9 +633,9 @@ class PipeRimDetector:
         mode_idx = int(np.argmax(hist))
         r_mode = 0.5 * (bin_edges[mode_idx] + bin_edges[mode_idx+1])
 
-        tol = max(4.0, 0.04 * r_mode)                # ±4 px or ±4%
+        tol = max(5.0, 0.05 * r_mode)                # ±5 px or ±5% (more tolerant)
         inliers = np.abs(rad_v - r_mode) <= tol
-        if inliers.sum() < 30:
+        if inliers.sum() < 20:  # Lower minimum requirement
             return float(np.median(rad_v))           # fallback
 
         return float(np.median(rad_v[inliers]))      # robust center of the mode
@@ -688,12 +710,12 @@ class PipeRimDetector:
         if r >= border_margin:
             return False
 
-        # Contrast sign: outer must be brighter than inner by at least 8
-        if contrast <= 8:
+        # Contrast sign: outer must be brighter than inner (relaxed for low-contrast scenes)
+        if contrast <= 3:
             return False
 
-        # Angle coverage weighting: stricter threshold for occluded scenes
-        if coverage < 0.45:
+        # Angle coverage: relaxed for partially occluded pipes
+        if coverage < 0.30:
             return False
 
         # Second-derivative thinness test: require median FWHM ≤ 6 px
@@ -719,7 +741,7 @@ class PipeRimDetector:
         except:
             pass  # skip if polar fails
 
-        return outward_ratio >= 0.55
+        return outward_ratio >= 0.40
 
     def _refine_circle_fit(
         self, edges: np.ndarray, init_cx: float, init_cy: float, init_r: float
