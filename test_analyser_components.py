@@ -7,6 +7,7 @@ import pickle
 import numpy as np
 from Analyser_Batch import BatchDefectDetector, DetectionConfig
 from TextExtractor.ExtrctInfo import TextExtractor
+from Reporter.ExcelReporter import ExcelReporter
 
 class ComponentTester:
     """Test individual components of BatchDefectDetector."""
@@ -415,12 +416,129 @@ class ComponentTester:
             }
             print(f"✗ Root classification failed: {e}")
             raise
-            
-    def save_results(self, output_path="test_results.json"):
+
+    def test_excel_reporting(self, frames, predictions):
+        """Test Excel report generation."""
+        print("\n=== Testing Excel Reporting ===")
+        try:
+            # Check if root classification results are cached
+            root_classification_cached = False
+            test_results_path = "frames_detections.json"
+
+            if os.path.exists(test_results_path):
+                try:
+                    with open(test_results_path, 'r') as f:
+                        cached_results = json.load(f)
+                    if 'root_classification' in cached_results and cached_results['root_classification'].get('status') == 'PASS':
+                        root_classification_cached = True
+                        print("✓ Using cached root classification results for Excel reporting")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # If root classification not cached, run it first
+            if not root_classification_cached:
+                print("⊘ Root classification not cached, running classification first...")
+                self.test_root_classification(frames[:len(predictions)], predictions)
+
+            # Create temporary all_detections for testing
+            temp_detections = {}
+            for frame_idx, (frame, output) in enumerate(zip(frames, predictions)):
+                instances = output["instances"].to("cpu")
+
+                if len(instances) == 0:
+                    continue
+
+                classes = instances.pred_classes.numpy()
+                boxes = instances.pred_boxes.tensor.numpy()
+                scores = instances.scores.numpy()
+
+                detections = []
+                for box, class_id, score in zip(boxes, classes, scores):
+                    detection = {
+                        "bbox": box.tolist(),
+                        "class": self.detector.metadata.thing_classes[class_id],
+                        "confidence": float(score),
+                        "frame_time": 0.0,
+                        "timestamp_seconds": frame_idx * 1.0
+                    }
+                    detections.append(detection)
+
+                if detections:
+                    temp_detections[f"Image_{frame_idx + 1}"] = {
+                        "Detection": detections,
+                        "frame_path": f"test_frame_{frame_idx}.jpg",
+                        "text_info": str(frame_idx * 0.1)  # Mock distance
+                    }
+
+            # Temporarily replace detector's all_detections for root classification
+            original_detections = self.detector.all_detections
+            self.detector.all_detections = temp_detections
+
+            # Apply root classification to the temp detections if classifier is available
+            if self.detector.root_classifier is not None and not root_classification_cached:
+                self.detector._classify_root_detections(frames, predictions)
+                print("✓ Root classification applied for Excel report testing")
+
+            # Get the updated detections with root subclasses
+            temp_detections = self.detector.all_detections
+
+            # Create test output directory
+            test_output_dir = "test_excel_output"
+            os.makedirs(test_output_dir, exist_ok=True)
+
+            # Create Excel reporter
+            reporter = ExcelReporter(
+                input_path=test_output_dir,
+                excelOutPutName="Test-Condition-Details.xlsx",
+                progress_logger=self.detector.progress_logger
+            )
+
+            # Generate report with the classified detections
+            reporter.generate_report()
+
+            # Restore original detections
+            self.detector.all_detections = original_detections
+
+            # Check if Excel file was created
+            excel_path = os.path.join(test_output_dir, "Test-Condition-Details.xlsx")
+            if os.path.exists(excel_path):
+                self.test_results['excel_reporting'] = {
+                    'status': 'PASS',
+                    'excel_file': excel_path,
+                    'frames_processed': len(temp_detections)
+                }
+                print(f"✓ Excel report generated: {excel_path}")
+                print(f"✓ Processed {len(temp_detections)} frames with detections")
+            else:
+                self.test_results['excel_reporting'] = {
+                    'status': 'FAIL',
+                    'reason': 'Excel file not created'
+                }
+                print("✗ Excel report generation failed - file not created")
+
+        except Exception as e:
+            self.test_results['excel_reporting'] = {
+                'status': 'FAIL',
+                'error': str(e)
+            }
+            print(f"✗ Excel reporting test failed: {e}")
+
+    def save_results(self, output_path="frames_detections.json"):
         """Save test results to JSON."""
+        test_output_dir = "test_excel_output"
+        output_path = os.path.join(test_output_dir, "frames_detections.json")
         with open(output_path, 'w') as f:
             json.dump(self.test_results, f, indent=4)
         print(f"\n✓ Test results saved to {output_path}")
+
+    def _save_results(self, output_path):
+        """Save detection results to JSON (same as Analyser_Batch)"""
+        base_name = os.path.basename(output_path).split("_")[0]
+
+        json_output_path = os.path.join(output_path, "frames_detections.json")
+        with open(json_output_path, 'w') as f:
+            json.dump(self.detector.all_detections, f, indent=4)
+        print(f"✓ Detection data saved to {json_output_path}")
         
     def run_all_tests(self):
         """Run all component tests sequentially."""
@@ -442,9 +560,15 @@ class ComponentTester:
             
             # Test 4: Root Classification
             self.test_root_classification(frames[:len(predictions)], predictions)
-            
+
             # Save results
             self.save_results()
+
+            
+            # Test 5: Excel Reporting
+            self.test_excel_reporting(frames[:len(predictions)], predictions)
+
+          
             
             # Print summary
             self._print_summary()
@@ -457,7 +581,7 @@ class ComponentTester:
         """Run a single component test.
         
         Args:
-            test_name: Name of test to run ('frame_collection', 'detection_ai', 'text_extraction', 'root_classification')
+            test_name: Name of test to run ('frame_collection', 'detection_ai', 'text_extraction', 'root_classification', 'excel_reporting')
         """
         print("\n" + "="*50)
         print(f"COMPONENT TESTING - {test_name.replace('_', ' ').title()}")
@@ -470,18 +594,20 @@ class ComponentTester:
             predictions = None
             
             # Collect frames if needed
-            if test_name in ['frame_collection', 'detection_ai', 'text_extraction', 'root_classification']:
+            if test_name in ['frame_collection', 'detection_ai', 'text_extraction', 'root_classification', 'excel_reporting']:
                 frames, timestamps = self.test_frame_collection(use_cache=self.use_cache)
-                
+
             # Run AI detection if needed
-            if test_name in ['detection_ai', 'root_classification']:
+            if test_name in ['detection_ai', 'root_classification', 'excel_reporting']:
                 predictions = self.test_detection_ai(frames[:20], use_cache=self.use_cache)
-                
+
             # Run the requested test
             if test_name == 'text_extraction':
                 self.test_text_extraction(frames[:10])
             elif test_name == 'root_classification':
                 self.test_root_classification(frames[:len(predictions)], predictions)
+            elif test_name == 'excel_reporting':
+                self.test_excel_reporting(frames[:len(predictions)], predictions)
             
             # Save results
             self.save_results()
@@ -523,7 +649,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Test individual components of Analyser_Batch')
-    parser.add_argument('--test', type=str, choices=['all', 'frame_collection', 'detection_ai', 'text_extraction', 'root_classification'],
+    parser.add_argument('--test', type=str, choices=['all', 'frame_collection', 'detection_ai', 'text_extraction', 'root_classification', 'excel_reporting'],
                        default='all', help='Specify which test to run')
     parser.add_argument('--video', type=str, 
                        default=r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4",

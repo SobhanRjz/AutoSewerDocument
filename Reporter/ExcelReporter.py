@@ -52,7 +52,10 @@ class ExcelReporter:
             "مسیر تصویر": "frame_path",
             "فاصله از نقطه شروع": "text_info",
             "کد عیوب": ["Detection", "class"],
-            "شدت عیب": ["Detection", "confidence"]
+            "شدت عیب": ["Detection", "confidence"],
+            "محل قرارگیری از ساعت": ["Detection", "clock_start"],
+            "محل قرارگیری تا ساعت": ["Detection", "clock_end"],
+            "درصد": ["Detection", "area_coverage_pct"]
         }
 
     def load_json_data(self, path) -> Dict:
@@ -128,12 +131,40 @@ class ExcelReporter:
                                 value = entry.get(key, [])
                             elif header == "کد عیوب":
                                 raw_value = detection[key[1]]
-                                value = self.DefectsCodeDict.get(raw_value, raw_value)
+                                # Check if this is a Root defect with subclass
+                                if raw_value == "Root" and "root_subclass" in detection:
+                                    subclass = detection["root_subclass"].lower()
+                                    if subclass == "fine":
+                                        value = "RF"
+                                    elif subclass == "tap":
+                                        value = "RT"
+                                    elif subclass == "mass":
+                                        value = "RM"
+                                    else:
+                                        value = self.DefectsCodeDict.get(raw_value, raw_value)
+                                else:
+                                    value = self.DefectsCodeDict.get(raw_value, raw_value)
                             elif header == "شدت عیب":
                                 value = detection[key[1]]
                             elif header == "نام فارسی عیوب":
                                 raw_value = detection[key[1]]
                                 value = self.DefectsCodeDict["BasicName_fa"].get(raw_value, raw_value)
+                            elif header == "درصد":
+
+                                if "area_coverage_pct" in detection:
+                                    val = detection[key[1]]
+                                    if isinstance(val, (int, float)):
+                                        # Round to nearest 5 (e.g., 53→55, 66→65)
+                                        value = int(round(val / 5.0) * 5)
+                                    else:
+                                        value = val
+                                else:
+                                    value = ""
+                            elif header == "محل قرارگیری از ساعت":
+                                value = detection[key[1]]
+                               
+                            elif header == "محل قرارگیری تا ساعت":
+                                value = detection[key[1]]
                             else:
                                 # For other fields, check if they're in detection or entry
                                 if isinstance(key, list):
@@ -260,7 +291,7 @@ class ExcelReporter:
 if __name__ == "__main__":
     reporter = ExcelReporter(
         "modern_styled_condition_details_filled.xlsx",
-        r"C:\Users\sobha\Desktop\detectron2\Data\E.Hormozi\olympicSt25zdo4931Surveyupstream_output",
+        r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection_output",
         ProgressLogger()
     )
     reporter.generate_report()

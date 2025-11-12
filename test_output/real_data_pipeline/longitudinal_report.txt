@@ -1,0 +1,90 @@
+======================================================================
+LONGITUDINAL COVERAGE REPORT
+======================================================================
+
+Overall Statistics:
+  Total Distance: 176.0 m
+  Total Frames: 25
+  Frames with Defects: 24
+  Mean Coverage: 21.3%
+  P90 Coverage: 31.8%
+  Longitudinal Coverage: 96.0%
+    (24/25 segments with defects)
+
+Per-Meter Segments:
+  [33.0m - 34.0m]:
+    Frames: 1, Mean: 14.4%, P90: 14.4%
+      Root: 14.4%
+  [34.0m - 35.0m]:
+    Frames: 1, Mean: 12.2%, P90: 12.2%
+      Root: 12.2%
+  [35.0m - 36.0m]:
+    Frames: 1, Mean: 11.9%, P90: 11.9%
+      Root: 11.9%
+  [36.0m - 37.0m]:
+    Frames: 1, Mean: 11.9%, P90: 11.9%
+      Root: 11.9%
+  [52.0m - 53.0m]:
+    Frames: 1, Mean: 18.9%, P90: 18.9%
+      Root: 18.9%
+  [53.0m - 54.0m]:
+    Frames: 1, Mean: 20.3%, P90: 20.3%
+      Root: 20.3%
+  [82.0m - 83.0m]:
+    Frames: 1, Mean: 16.1%, P90: 16.1%
+      Root: 16.1%
+  [83.0m - 84.0m]:
+    Frames: 1, Mean: 22.2%, P90: 22.2%
+      Root: 22.2%
+  [98.0m - 99.0m]:
+    Frames: 1, Mean: 30.0%, P90: 30.0%
+      Root: 30.0%
+  [99.0m - 100.0m]:
+    Frames: 1, Mean: 26.9%, P90: 26.9%
+      Root: 26.9%
+  [105.0m - 106.0m]:
+    Frames: 1, Mean: 0.0%, P90: 0.0%
+  [106.0m - 107.0m]:
+    Frames: 1, Mean: 7.8%, P90: 7.8%
+      Root: 7.8%
+  [127.0m - 128.0m]:
+    Frames: 1, Mean: 18.9%, P90: 18.9%
+      Root: 18.9%
+  [128.0m - 129.0m]:
+    Frames: 1, Mean: 17.5%, P90: 17.5%
+      Root: 17.5%
+  [129.0m - 130.0m]:
+    Frames: 1, Mean: 16.1%, P90: 16.1%
+      Root: 16.1%
+  [131.0m - 132.0m]:
+    Frames: 1, Mean: 10.0%, P90: 10.0%
+      Root: 10.0%
+  [142.0m - 143.0m]:
+    Frames: 1, Mean: 24.4%, P90: 24.4%
+      Root: 24.4%
+  [143.0m - 144.0m]:
+    Frames: 1, Mean: 25.6%, P90: 25.6%
+      Root: 25.6%
+  [144.0m - 145.0m]:
+    Frames: 1, Mean: 25.0%, P90: 25.0%
+      Root: 25.0%
+  [145.0m - 146.0m]:
+    Frames: 1, Mean: 24.2%, P90: 24.2%
+      Root: 24.2%
+  [146.0m - 147.0m]:
+    Frames: 1, Mean: 26.9%, P90: 26.9%
+      Root: 26.9%
+  [149.0m - 150.0m]:
+    Frames: 1, Mean: 33.9%, P90: 33.9%
+      Root: 24.7%
+      Deposits: 9.2%
+  [150.0m - 151.0m]:
+    Frames: 1, Mean: 60.0%, P90: 60.0%
+      Root: 60.0%
+  [151.0m - 152.0m]:
+    Frames: 1, Mean: 23.9%, P90: 23.9%
+      Root: 23.9%
+  [152.0m - 153.0m]:
+    Frames: 1, Mean: 33.1%, P90: 33.1%
+      Root: 33.1%
+======================================================================

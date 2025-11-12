@@ -94,21 +94,33 @@ def main():
         return
     
     print(f"✓ Loaded {len(frames)} frames with predictions\n")
-    
+
+    # Compute radius bounds from first frame
+    first_frame = frames[0]
+    h, w = first_frame.shape[:2]
+    Rmin = int(0.33 * min(h, w))
+    Rmax = int(0.48 * min(h, w))
+
     # Initialize components
     pipe_geometry = PipeGeometry(inner_diameter_mm=600)
     rim_detector = PipeRimDetector(
         edge_low=50,
         edge_high=150,
-        min_radius=400,
-        max_radius=900,
+        min_radius=Rmin,
+        max_radius=Rmax,
         ransac_iterations=5000,
         ransac_threshold=5.0,
         temporal_alpha=0.7,
         use_hough=True,
-        blur_kernel=5
+        blur_kernel=5,
+        confidence_threshold=1.0    # force refinement always
     )
-    coverage_analyzer = MultiClassCoverageAnalyzer(CLASS_NAMES, theta_bins=360)
+    coverage_analyzer = MultiClassCoverageAnalyzer(
+        CLASS_NAMES,
+        theta_bins=360,
+        inner_radius_factor=0.85,
+        outer_radius_factor=0.98   # was 1.0; tighten to hug the wall
+    )
     metrics_calculator = EngineeringMetricsCalculator(pipe_geometry)
     longitudinal_aggregator = LongitudinalAggregator(segment_length_m=1.0)
     

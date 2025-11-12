@@ -34,1375 +34,1463 @@ from PipeCoverage import PipeRimDetector, MultiClassCoverageAnalyzer
 
 @dataclass
 class TimingStats:
-    frame_collection_time: float = 0.0
-    preprocessing_time: float = 0.0
-    inference_time: float = 0.0
-    visualization_time: float = 0.0
-    total_time: float = 0.0
+	frame_collection_time: float = 0.0
+	preprocessing_time: float = 0.0
+	inference_time: float = 0.0
+	visualization_time: float = 0.0
+	total_time: float = 0.0
 
 @dataclass
 class DetectionConfig:
-    class_names: List[str]
-    colors: List[List[int]]
-    score_threshold: float = 0.7
-    nms_threshold: float = 0.2
-    model_path: str = None
-    config_path: str = None
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 16
-    custom_batch: bool = True
+	class_names: List[str]
+	colors: List[List[int]]
+	score_threshold: float = 0.7
+	nms_threshold: float = 0.2
+	model_path: str = None
+	config_path: str = None
+	device: str = "cuda" if torch.cuda.is_available() else "cpu"
+	batch_size: int = 16
+	custom_batch: bool = True
 
 class BatchDefectDetector:
-    def __init__(self, config: DetectionConfig, text_extractor=None):
-        self._setup_logging()
-        self.cfg = self._initialize_config(config)
-        self._initialize_model(config)
-        self._setup_dataset(config.class_names, config.colors)
-        
-        self.timing_stats = TimingStats()
-        self.custom_batch = config.custom_batch
-        self.all_detections = {}
-        self.text_extractor = text_extractor
-        self._setup_progress_logger()
-        self._initialize_few_shot_classifier()
-
-    def _setup_progress_logger(self):
-        # Initialize progress logger
-        self.progress_logger = ProgressLogger()
-        # Initialize stages with their weights
-        self.stages = {
-            "initialization": 5,
-            "frame extraction": 10,
-            "Ai detection": 40,
-            "text extraction": 30,
-            "excel reporting": 15
-        }
-        self.progress_logger.start_process(self.stages)
-
-        # Update progress for initialization stage
-        self.progress_logger.update_stage_progress(
-            "initialization",
-            80.0,
-            {"status": "Setting up detector configuration"}
-        )
-    
-    def _initialize_few_shot_classifier(self):
-        """Initialize root type classifier for few-shot detection."""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(base_dir, "Model", "MiniModel", "Root", "model.pth")
-        support_set_dir = os.path.join(base_dir, "Model", "MiniModel", "Root", "Support_Set")
-        
-        try:
-            self.root_classifier = RootClassifier(
-                model_path=model_path,
-                support_set_dir=support_set_dir,
-                device=self.cfg.MODEL.DEVICE
-            )
-            self.logger.info("Root classifier initialized successfully")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize root classifier: {e}")
-            self.root_classifier = None
-
-    def _setup_logging(self):
-        """Configure logging with detailed format"""
-        # Create logs directory if it doesn't exist
-        log_dir = "logs"
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-            
-        log_file = os.path.join(log_dir, "defect_detection.log")
-        
-        # Configure root logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler(log_file, mode='a')
-            ]
-        )
-        
-        # Create logger for this class
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-        
-        # Add file handler with rotation
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        )
-        self.logger.addHandler(file_handler)
-        
-        # Log startup message
-        self.logger.info("Initializing BatchDefectDetector")
-
-    def _initialize_model(self, config: DetectionConfig):
-        print("  Initializing Detectron2 model...")
-
-        # Build model and load weights into *this* model
-        self.model = build_model(self.cfg)
-        self.model.eval()
-        DetectionCheckpointer(self.model).load(self.cfg.MODEL.WEIGHTS)
-
-        # optional warmup (helps first-call latency)
-        with torch.inference_mode():
-            dummy = torch.zeros(3, self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST)
-            dummy_batch = [{
-                "image": dummy.to(self.cfg.MODEL.DEVICE),
-                "height": self.cfg.INPUT.MIN_SIZE_TEST,
-                "width": self.cfg.INPUT.MIN_SIZE_TEST,
-            }]
-            self.model(dummy_batch)
-
-        # keep predictor only if you want single-image path
-        self.predictor = DefaultPredictor(self.cfg)
-
-        self.aug = ResizeShortestEdge(
-            [self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST],
-            self.cfg.INPUT.MAX_SIZE_TEST
-        )
-        self.input_format = self.cfg.INPUT.FORMAT
-        assert self.input_format in ["RGB", "BGR"], self.input_format
-
-        print("  Detectron2 model initialized successfully")
-
-    def _setup_dataset(self, class_names: List[str], colors: List[List[int]]) -> None:
-        """Setup custom dataset metadata"""
-        MetadataCatalog.get("custom_dataset").set(thing_classes=class_names)
-        self.metadata = MetadataCatalog.get("custom_dataset")
-        self.metadata.thing_colors = colors
-        
-        # Initialize pipe coverage analyzer now that we have class names
-        try:
-            self.rim_detector = PipeRimDetector(
-                edge_low=50,
-                edge_high=150,
-                min_radius=400,
-                max_radius=900,
-                ransac_iterations=5000,
-                ransac_threshold=5.0,
-                temporal_alpha=0.7,
-                use_hough=True,
-                blur_kernel=5
-            )
-            self.coverage_analyzer = MultiClassCoverageAnalyzer(class_names, theta_bins=360)
-            self.logger.info("Pipe coverage analyzer initialized successfully")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize coverage analyzer: {e}")
-            self.rim_detector = None
-            self.coverage_analyzer = None
-
-    def _initialize_config(self, config: DetectionConfig):
-        """Initialize Detectron2 configuration"""
-        cfg = get_cfg()
-        cfg.merge_from_file(config.config_path)
-        cfg.MODEL.WEIGHTS = config.model_path
-        cfg.MODEL.DEVICE = config.device
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = config.score_threshold
-        cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = config.nms_threshold
-        cfg.MODEL.ROI_HEADS.CLASS_NAMES = config.class_names
-        return cfg
-
-    def preprocess(self, images):
-        """Preprocess batch of images for inference"""
-        preprocess_start = time.time()
-        batch_inputs = []
-        
-        for img in images:
-            if self.input_format == "RGB":
-                img = img[:, :, ::-1]  # Convert BGR → RGB
-            
-            height, width = img.shape[:2]
-            img_transformed = self.aug.get_transform(img).apply_image(img)
-            img_tensor = torch.as_tensor(img_transformed.astype("float32").transpose(2, 0, 1))
-            
-            batch_inputs.append({
-                "image": img_tensor.to(self.cfg.MODEL.DEVICE),
-                "height": height,
-                "width": width
-            })
-            
-        self.timing_stats.preprocessing_time += time.time() - preprocess_start
-        return batch_inputs
-
-    def reset_for_new_video(self):
-        """Reset detector state for processing a new video"""
-        self.all_detections = {}
-        self.timing_stats = TimingStats()
-        self.distance_base = 0
-        self._setup_progress_logger()
-
-    def process_video(self, input_path: str, output_path: str, batch_size: int = 8):
-        self.progress_logger.complete_stage(
-            "initialization",
-            {"status": "Detector configuration setup complete"}
-        )
-
-        """Process video file in batches for object detection"""
-        process_start = time.time()
-        
-        frames_to_process, timestamps_to_process = self._collect_frames(input_path)
-        
-        # Process frames in batches
-        all_predictions, all_frames, all_timestamps = self._process_batches(
-            frames_to_process,
-            timestamps_to_process,
-            batch_size
-        )
-
-        # Visualize and save results
-        frames_dir = os.path.join(output_path, "frames")
-        os.makedirs(frames_dir, exist_ok=True)
-        
-        if self.custom_batch:
-            self._visualize_batch(all_frames, all_predictions, all_timestamps, frames_dir)
-        else:
-            self._visualize_batch_default(all_frames, all_predictions, all_timestamps)
-
-        self._extract_and_process_text(all_frames)
-        self.modify_detection_baseExperience()
-
-        # Apply few-shot classification to root detections after filtering
-        self._classify_root_detections(all_frames, all_predictions)
-
-        self._save_results(output_path)
-        self._log_timing_stats(process_start)
-
-        return frames_to_process
-    
-    def modify_detection_baseExperience(self):
-
-        try:
-            """Modify detection base experience"""
-            # Group detections by text_info (distance)
-            self.all_detectionsBaseCopy = self.all_detections.copy()
-            distance_groups = {}
-            for frame_key, frame_data in self.all_detections.items():
-                distance = frame_data["text_info"]
-                if distance not in distance_groups:
-                    distance_groups[distance] = []
-                distance_groups[distance].append((frame_key, frame_data))
-
-            # Process detection groups based on detection count
-            filtered_groups = {}
-            
-            for distance, group in distance_groups.items():
-                # Check if all frames in this group have exactly 1 detection
-                all_single_detection = all(len(frame_data["Detection"]) == 1 for _, frame_data in group)
-                
-                if all_single_detection:
-                    # If all frames have exactly 1 detection, keep the most repetitive class
-                    class_counts = {}
-                    for _, frame_data in group:
-                        defect_class = frame_data["Detection"][0]["class"]
-                        class_counts[defect_class] = class_counts.get(defect_class, 0) + 1
-                    
-                    # Find the most common class
-                    most_common_class = max(class_counts.items(), key=lambda x: x[1])[0] if class_counts else None
-                    
-                    # Keep only frames with the most common class
-                    if most_common_class:
-                        filtered_frames = []
-                        for frame_key, frame_data in group:
-                            if frame_data["Detection"][0]["class"] == most_common_class:
-                                filtered_frames.append((frame_key, frame_data))
-                        
-                        filtered_groups[distance] = filtered_frames
-                        self.logger.info(f"Distance {distance}: Kept {len(filtered_frames)} frames with most common class '{most_common_class}'")
-                else:
-                    # If some frames have multiple detections, keep only those with 2+ detections
-                    multi_detection_frames = []
-                    for frame_key, frame_data in group:
-                        if len(frame_data["Detection"]) >= 2:
-                            multi_detection_frames.append((frame_key, frame_data))
-                    
-                    if multi_detection_frames:
-                        filtered_groups[distance] = multi_detection_frames
-                        self.logger.info(f"Distance {distance}: Kept {len(multi_detection_frames)} frames with 2+ detections")
-            
-            
-            # First, filter out duplicate detections within each frame
-            for distance, group in filtered_groups.items():
-                for frame_idx, (frame_key, frame_data) in enumerate(group):
-                    # Track unique classes we've seen in this frame
-                    seen_classes = set()
-                    unique_detections = []
-                    
-                    # Process each detection and keep only unique classes
-                    for detection in frame_data["Detection"]:
-                        defect_class = detection["class"]
-                        if defect_class not in seen_classes:
-                            seen_classes.add(defect_class)
-                            unique_detections.append(detection)
-                    
-                    # Update the frame data with unique detections
-                    frame_data["Detection"] = unique_detections
-                    group[frame_idx] = (frame_key, frame_data)
-                    
-                # Update the distance group with the modified frames
-                distance_groups[distance] = group
-                
-            # Now filter out duplicate frames that have identical class combinations
-            for distance, group in distance_groups.items():
-                # Track unique class combinations we've seen
-                unique_class_combinations = []
-                unique_frames = []
-                
-                for frame_key, frame_data in group:
-                    # Get sorted list of classes in this frame
-                    frame_classes = sorted([d["class"] for d in frame_data["Detection"]])
-                    class_combination = tuple(frame_classes)
-                    
-                    # If we haven't seen this combination before, keep it
-                    if class_combination not in unique_class_combinations:
-                        unique_class_combinations.append(class_combination)
-                        unique_frames.append((frame_key, frame_data))
-                
-                # Update the distance group with unique frames
-                distance_groups[distance] = unique_frames
-                
-            self.logger.info(f"Filtered detection groups to keep only unique class combinations")
-
-            # Filter out frames that are too close to each other (less than 0.15m apart)
-            self.logger.info("Filtering frames that are too close to each other (< 0.15m)")
-            
-            # Convert distance strings to floats and sort them
-            distances = sorted([(d) for d in distance_groups.keys()])
-            
-            # Create a new filtered dictionary to store the results
-            final_filtered_groups = {}
-            
-            # Process distances in order
-            i = 0
-            while i < len(distances):
-                current_distance = distances[i]
-                current_key = str(current_distance)
-                
-                # Add the first distance to our filtered results
-                if i == 0:
-                    final_filtered_groups[current_key] = distance_groups[current_key]
-                    i += 1
-                    continue
-                
-                # Get the previous distance we kept
-                prev_distance = distances[i-1]
-                prev_key = str(prev_distance)
-                
-                # Check if current distance is too close to previous one
-                # Convert to float for numerical comparison
-                if float(current_distance) - float(prev_distance) < 0.15:
-                    # Compare the number of detections
-                    current_frames = distance_groups[current_key]
-                    prev_frames = distance_groups[current_key]  # Use from final_filtered_groups instead
-                    
-                    # Count total detections in current distance group
-                    current_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in current_frames)
-                    
-                    # Count total detections in previous distance group
-                    prev_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in prev_frames)
-                    
-                    if current_detection_count > prev_detection_count:
-                        # Current has more detections, replace previous
-                        if prev_key in final_filtered_groups:
-                            del final_filtered_groups[prev_key]
-                        final_filtered_groups[current_key] = current_frames
-                    elif current_detection_count == prev_detection_count:
-                        # Equal detection counts, compare confidence scores
-                        current_max_confidence = max(
-                            [detection.get("confidence", 0) for _, frame_data in current_frames 
-                            for detection in frame_data["Detection"]], 
-                            default=0
-                        )
-                        prev_max_confidence = max(
-                            [detection.get("confidence", 0) for _, frame_data in prev_frames 
-                            for detection in frame_data["Detection"]], 
-                            default=0
-                        )
-                        
-                        if current_max_confidence > prev_max_confidence:
-                            # Current has higher confidence, replace previous
-                            if prev_key in final_filtered_groups:
-                                del final_filtered_groups[prev_key]
-                            final_filtered_groups[current_key] = current_frames
-                        # If previous has higher confidence, keep it (do nothing)
-                else:
-                    # Distance is not too close, keep current frame
-                    final_filtered_groups[current_key] = distance_groups[current_key]
-                
-                i += 1
-            
-            # Replace distance_groups with our filtered version
-            distance_groups = final_filtered_groups
-            
-            # Filter out similar detections across different distance groups using IoU
-            self.logger.info("Filtering similar detections across distance groups based on bounding box similarity")
-            
-            def _calculate_bbox_similarity(self, bbox1, bbox2):
-                """Calculate IoU (Intersection over Union) between two bounding boxes"""
-                # Extract coordinates
-                x1_1, y1_1, x2_1, y2_1 = bbox1
-                x1_2, y1_2, x2_2, y2_2 = bbox2
-                
-                # Calculate intersection area
-                x_left = max(x1_1, x1_2)
-                y_top = max(y1_1, y1_2)
-                x_right = min(x2_1, x2_2)
-                y_bottom = min(y2_1, y2_2)
-                
-                # Check if there is an intersection
-                if x_right < x_left or y_bottom < y_top:
-                    return 0.0
-                    
-                intersection_area = (x_right - x_left) * (y_bottom - y_top)
-                
-                # Calculate union area
-                bbox1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
-                bbox2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
-                union_area = bbox1_area + bbox2_area - intersection_area
-                
-                # Calculate IoU
-                iou = intersection_area / union_area if union_area > 0 else 0.0
-                return iou
-            
-            # Convert method to function for use within this scope
-            calculate_bbox_similarity = lambda bbox1, bbox2: _calculate_bbox_similarity(self, bbox1, bbox2)
-            
-            # Group similar detections across distance groups
-            similarity_groups = []
-            processed_frames = set()
-            
-            # Sort distance groups by distance for consistent processing
-            sorted_distances = sorted(distance_groups.keys(), key=lambda x: float(x))
-            
-            for i, distance1 in enumerate(sorted_distances):
-                group1 = distance_groups[distance1]
-                
-                for frame1_key, frame1_data in group1:
-                    if frame1_key in processed_frames:
-                        continue
-                    
-                    # Create a new similarity group
-                    current_group = [(frame1_key, frame1_data)]
-                    processed_frames.add(frame1_key)
-                    
-                    # Compare with other distance groups
-                    for j in range(i+1, len(sorted_distances)):
-                        distance2 = sorted_distances[j]
-                        group2 = distance_groups[distance2]
-                        
-                        for frame2_key, frame2_data in group2:
-                            if frame2_key in processed_frames:
-                                continue
-                            
-                            # Check if detections are similar using IoU
-                            is_similar = False
-                            
-                            # Compare all detections between the two frames
-                            for detection1 in frame1_data["Detection"]:
-                                for detection2 in frame2_data["Detection"]:
-                                    # Skip if classes are different
-                                    if detection1["class"] != detection2["class"]:
-                                        continue
-                                        
-                                    # Calculate IoU between bounding boxes
-                                    iou = calculate_bbox_similarity(detection1["bbox"], detection2["bbox"])
-                                    
-                                    # If IoU is above threshold, consider them similar
-                                    if iou > 0.6:  # Threshold can be adjusted
-                                        is_similar = True
-                                        break
-                                
-                                if is_similar:
-                                    break
-                            
-                            # If similar, add to current group and mark as processed
-                            if is_similar:
-                                current_group.append((frame2_key, frame2_data))
-                                processed_frames.add(frame2_key)
-                    
-                    # Add the group to similarity groups if it has at least one frame
-                    if current_group:
-                        similarity_groups.append(current_group)
-            
-            # For each similarity group, keep only the frame with highest confidence or most detections
-            optimized_groups = {}
-            
-            for group in similarity_groups:
-                if not group:
-                    continue
-                    
-                # Find the best frame in the group
-                best_frame_key = None
-                best_frame_data = None
-                max_detection_count = -1
-                max_confidence = -1
-                
-                for frame_key, frame_data in group:
-                    # Count detections
-                    detection_count = len(frame_data["Detection"])
-                    
-                    # Calculate average confidence
-                    avg_confidence = sum(d.get("confidence", 0) for d in frame_data["Detection"]) / detection_count if detection_count > 0 else 0
-                    
-                    # Prioritize by detection count, then by confidence
-                    if detection_count > max_detection_count or (detection_count == max_detection_count and avg_confidence > max_confidence):
-                        max_detection_count = detection_count
-                        max_confidence = avg_confidence
-                        best_frame_key = frame_key
-                        best_frame_data = frame_data
-                
-                # Add the best frame to optimized groups
-                if best_frame_key and best_frame_data:
-                    distance = best_frame_data["text_info"]
-                    if distance not in optimized_groups:
-                        optimized_groups[distance] = []
-                    optimized_groups[distance].append((best_frame_key, best_frame_data))
-            
-            # Replace distance_groups with optimized version
-            distance_groups = optimized_groups
-            
-            self.logger.info(f"After similarity filtering: kept {len(distance_groups)} distance groups with {sum(len(group) for group in distance_groups.values())} frames")
-            # Update all_detections with filtered results
-            self.all_detections = {}
-            for distance, frames in distance_groups.items():
-                for frame_key, frame_data in frames:
-                    self.all_detections[frame_key] = frame_data
-            
-            self.logger.info(f"After proximity filtering: kept {len(distance_groups)} distance groups")
-
-        except Exception as e:
-            self.logger.error(f"Error modifying detection base experience: {str(e)}")
-        
-
-        # Remove any detections not in filtered groups and their associated frames
-        for key, frame_data in self.all_detectionsBaseCopy.items():
-            if key not in self.all_detections:
-
-                self.logger.info(f"Frame {key} was in original detections but removed in filtering")               # Remove associated frame image if it exists
-                if "frame_path" in frame_data:
-                    try:
-                        os.remove(frame_data["frame_path"])
-                        base_dir = os.path.dirname(frame_data["frame_path"])
-                        Predictions_dir = os.path.join(base_dir, "predictions_frames")
-                        PredImageName = os.path.join(Predictions_dir, os.path.basename(frame_data["frame_path"]))
-                        os.remove(PredImageName)
-                        self.logger.info(f"Removed frame image: {frame_data['frame_path']}")
-                    except Exception as e:
-                        self.logger.error(f"Error removing frame image {frame_data['frame_path']}: {str(e)}")
-
-
-    def _collect_frames(self, input_path: str):
-        """Collect frames from video file using FFmpeg with hardware acceleration"""
-
-        self.logger.info("Starting fast frame collection with FFmpeg...")
-        frame_collection_start = time.time()
-
-        # Get first frame for ROI selection (text extractor needs this)
-        cap = cv2.VideoCapture(input_path)
-        ret, first_frame = cap.read()
-        if ret:
-            self.text_extractor._get_user_roi(first_frame)
-        # cap.release()
-
-        if not cap.isOpened():
-            self.logger.error(f"Error opening video file {input_path}")
-            return [], []
-
-        # Use FFmpeg for fast frame extraction with downsampling
-        target_fps = 1  # Downsample to 1 FPS for efficiency
-
-        # Calculate target dimensions once (shared between FFmpeg and OpenCV)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        #target_width, target_height = self._calculate_target_dimensions(w, h)
-        target_width, target_height = w, h
-        try:
-            frames_to_process, timestamps_to_process = self._collect_frames_ffmpeg(
-                input_path, target_fps=target_fps, width=target_width, height=target_height
-            )
-        except RuntimeError as e:
-            self.logger.warning(f"FFmpeg frame extraction failed: {e}")
-            self.logger.info("Falling back to OpenCV frame extraction...")
-            # Fallback to OpenCV method with same target dimensions
-            frames_to_process, timestamps_to_process = self._collect_frames_opencv(
-                input_path, target_width=target_width, target_height=target_height
-            )
-
-        self.timing_stats.frame_collection_time = time.time() - frame_collection_start
-        self.logger.info(f"FFmpeg frame collection complete. Total frames: {len(frames_to_process)}. "
-                        f"Time taken: {self.timing_stats.frame_collection_time:.2f}s")
-
-        self.progress_logger.complete_stage(
-            "frame extraction",
-            {"status": "Frame collection complete"}
-        )
-
-        return frames_to_process, timestamps_to_process
-
-    def _collect_frames_ffmpeg(self, path, target_fps=1, width=None, height=None):
-        """Fast frame collection using FFmpeg with hardware acceleration and downsampling"""
-        # Pick best hwaccel
-        def try_cmd(hw=None):
-            vf = [f"fps={target_fps}"]
-            if width and height:
-                # scale on GPU when possible; otherwise CPU scale is fine
-                if hw == "cuda":
-                    vf.append(f"scale_cuda={width}:{height}")
-                else:
-                    vf.append(f"scale={width}:{height}")
-            vf = ",".join(vf)
-
-            base = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-            if hw == "cuvid":
-                # Most reliable NVIDIA hwaccel
-                base += ["-hwaccel", "cuvid", "-c:v", "h264_cuvid"]
-            elif hw == "cuda":
-                # Alternative NVIDIA hwaccel
-                base += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-            elif hw == "d3d11va":
-                # Intel/AMD hwaccel
-                base += ["-hwaccel", "d3d11va"]
-            # hw == None uses CPU (no hwaccel flags)
-            base += ["-i", path, "-vf", vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
-            return base
-
-        # Figure out output size (use provided dimensions or get from video)
-        if width is None or height is None:
-            cap = cv2.VideoCapture(path)
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if width is None else width
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if height is None else height
-            cap.release()
-        else:
-            w, h = width, height
-
-        frame_bytes = w * h * 3
-
-        # Try hardware acceleration in order of reliability: cuvid > cuda > d3d11va > cpu
-        hw_options = []
-        if torch.cuda.is_available():
-            hw_options.extend(["cuvid", "cuda"])  # cuvid is more reliable than cuda
-        hw_options.extend(["d3d11va", None])  # d3d11va for Intel/AMD, None for CPU fallback
-
-        for hw in hw_options:
-            try:
-                self.logger.info(f"Trying FFmpeg with hwaccel: {hw or 'cpu'}")
-                p = subprocess.Popen(try_cmd(hw), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                frames, ts = [], []
-                i = 0
-                read = p.stdout.read
-                while True:
-                    buf = read(frame_bytes)
-                    if not buf or len(buf) < frame_bytes:
-                        break
-                    frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-                    frames.append(frame)
-                    ts.append(i/float(target_fps))
-                    i += 1
-                p.stdout.close()
-                p.wait()
-
-                if p.returncode == 0 and len(frames) > 0:
-                    self.logger.info(f"Successfully collected {len(frames)} frames using {hw or 'cpu'} hwaccel")
-                    return frames, ts
-                else:
-                    # Get stderr for debugging
-                    stderr_output = p.stderr.read().decode('utf-8', errors='ignore') if p.stderr else ""
-                    self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed (exit code: {p.returncode})")
-                    if stderr_output:
-                        # Show first 300 chars of error
-                        error_preview = stderr_output[:300] + "..." if len(stderr_output) > 300 else stderr_output
-                        self.logger.warning(f"FFmpeg stderr: {error_preview}")
-                    else:
-                        self.logger.warning("No stderr output from FFmpeg")
-            except Exception as e:
-                self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed: {e}")
-                continue  # try next hwaccel
-
-        raise RuntimeError("FFmpeg frame extraction failed with all hardware acceleration options.")
-
-    def _calculate_target_dimensions(self, original_width: int, original_height: int) -> tuple[int, int]:
-        """Calculate target dimensions for frame processing with intelligent downscaling"""
-        # Downscale large videos for better performance (sewer videos don't need 1080p)
-        # Most sewer inspection videos are 720p or smaller, but handle 1080p gracefully
-        if original_height > 720:
-            target_height = 720
-            target_width = int(original_width * 720 / original_height)  # Maintain aspect ratio
-            self.logger.info(f"Downscaling from {original_width}x{original_height} to {target_width}x{target_height} for performance")
-        else:
-            target_width, target_height = original_width, original_height
-
-        return target_width, target_height
-
-    def _collect_frames_opencv(self, input_path: str, target_width: int = None, target_height: int = None):
-        """Fallback frame collection using OpenCV (slower but reliable)"""
-        frames_to_process = []
-        timestamps_to_process = []
-
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            self.logger.error(f"Error opening video file {input_path}")
-            return [], []
-
-        # Get original dimensions
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        frame_interval = fps  # Extract 1 frame per second
-
-        # Use provided target dimensions or calculate them
-        if target_width is None or target_height is None:
-            target_w, target_h = self._calculate_target_dimensions(orig_w, orig_h)
-        else:
-            target_w, target_h = target_width, target_height
-            self.logger.info(f"OpenCV fallback: Using provided dimensions {target_w}x{target_h}")
-
-        frame_idx = 0
-        pbar = tqdm(total=total_frames, desc="Reading frames (fallback)", colour="cyan")
-
-        while frame_idx < total_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_idx % frame_interval == 0:
-                # Resize frame to target dimensions if needed
-                current_shape = frame.shape[:2]  # (height, width)
-                if current_shape != (target_h, target_w):
-                    frame = cv2.resize(frame, (target_w, target_h))
-
-                frames_to_process.append(frame)
-                timestamps_to_process.append(frame_idx / fps)
-
-            frame_idx += 1
-            pbar.update(1)
-
-            # Update progress for frame extraction stage
-            progress = (frame_idx / total_frames) * 100
-            if frame_idx % 800 == 0:
-                self.progress_logger.update_stage_progress(
-                    "frame extraction",
-                    progress,
-                    {"frames_processed": frame_idx, "total_frames": total_frames}
-                )
-
-        pbar.close()
-        cap.release()
-
-        self.logger.info(f"OpenCV fallback collected {len(frames_to_process)} frames")
-        return frames_to_process, timestamps_to_process
-
-    def _process_batches(self, frames, timestamps, batch_size):
-        """Process frames in batches"""
-        total_batches = math.ceil(len(frames) / batch_size)
-        self.logger.info(f"Starting batch processing of {len(frames)} frames in {total_batches} batches")
-        
-        all_predictions = []
-        all_frames = []
-        all_timestamps = []
-        batch_start_time = time.time()
-        total_batch_time = 0
-        
-        pbar = tqdm(range(0, len(frames), batch_size), desc="Processing batches",colour="cyan")
-        for i in pbar:
-            batch = frames[i:i + batch_size]
-            batch_timestamps = timestamps[i:i + batch_size]
-
-            current_batch = i // batch_size + 1
-            pbar.set_description(f"Processing batch {current_batch}/{total_batches}")
-            
-            # Run inference
-            if self.custom_batch:
-                outputs = self._predict_batch(batch)
-                all_predictions.extend(outputs)
-            else:
-                predictions = self._predict_batch_default(batch)
-                all_predictions.extend(predictions)
-            
-            all_frames.extend(batch)
-            all_timestamps.extend(batch_timestamps)
-            
-            # Log timing
-            batch_time = time.time() - batch_start_time
-            total_batch_time += batch_time
-            pbar.set_postfix({"Batch time": f"{batch_time:.2f}s", "Total time": f"{total_batch_time:.2f}s"})
-            batch_start_time = time.time()
-            
-            # Update progress for AI detection stage
-            progress = (current_batch / total_batches) * 100
-            if current_batch % 3 == 0:
-                self.progress_logger.update_stage_progress(
-                    "Ai detection",
-                    progress,
-                {
-                    "batch": current_batch,
-                    "total_batches": total_batches,
-                    "batch_time": f"{batch_time:.2f}s",
-                    "total_time": f"{total_batch_time:.2f}s"
-                }
-                )
-        
-        self.progress_logger.complete_stage(
-            "Ai detection",
-            {"status": "AI detection complete"}
-        )
-        return all_predictions, all_frames, all_timestamps
-    
-    def _classify_root_detections(self, frames, predictions):
-        """Apply few-shot classification to Root detections after filtering using full frames.
-
-        Args:
-            frames: List of frame images
-            predictions: List of prediction outputs from model
-        """
-        if self.root_classifier is None or not self.root_classifier.is_loaded():
-            self.logger.warning("Root classifier not available, skipping few-shot classification")
-            return
-
-        self.logger.info("Applying few-shot classification to remaining Root detections using full frames...")
-        root_class_idx = self.metadata.thing_classes.index("Root")
-        classified_count = 0
-
-        # Only process frames that remain after filtering
-        for frame_key, frame_data in self.all_detections.items():
-            if "Detection" not in frame_data:
-                continue
-
-            # Extract frame index from key (e.g., "Image_1" -> 0)
-            frame_idx = int(frame_key.split("_")[1]) - 1
-
-            if frame_idx >= len(frames) or frame_idx >= len(predictions):
-                continue
-
-            frame = frames[frame_idx]
-            output = predictions[frame_idx]
-
-            if not self.custom_batch:
-                instances = output["instances"]
-            else:
-                instances = output["instances"]
-
-            instances = instances.to("cpu")
-
-            if len(instances) == 0:
-                continue
-
-            boxes = instances.pred_boxes.tensor.numpy()
-            classes = instances.pred_classes.numpy()
-
-            # Get Root detections in this frame
-            root_detections = [(i, box) for i, (box, class_id) in enumerate(zip(boxes, classes))
-                             if class_id == root_class_idx]
-
-            for det_idx, box in root_detections:
-                # Use full frame for root classification instead of cropping
-                # Save full frame image temporarily
-                temp_dir = "temp_crops"
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_filename = os.path.join(temp_dir, f"full_frame_{frame_idx}_det_{det_idx}.jpg")
-                cv2.imwrite(temp_filename, frame)
-
-                try:
-                    result = self.root_classifier.predict(frame)
-
-                    # Update the stored detection with subclass info
-                    if det_idx < len(frame_data["Detection"]):
-                        frame_data["Detection"][det_idx]["root_subclass"] = result["class"]
-                        frame_data["Detection"][det_idx]["root_subclass_confidence"] = float(result["confidence"])
-
-                        # If classified as "mass", calculate pipe coverage
-                        if result["class"].lower() == "mass" and self.rim_detector and self.coverage_analyzer:
-                            try:
-                                coverage_info = self._calculate_mass_coverage(
-                                    frame, instances, det_idx, classes, frame_idx
-                                )
-                                if coverage_info:
-                                    frame_data["Detection"][det_idx]["angular_coverage_pct"] = coverage_info["angular_pct"]
-                                    frame_data["Detection"][det_idx]["area_coverage_pct"] = coverage_info["area_pct"]
-                                    self.logger.info(
-                                        f"Frame {frame_key}: Mass coverage - Angular: {coverage_info['angular_pct']:.1f}%, "
-                                        f"Area: {coverage_info['area_pct']:.1f}%"
-                                    )
-                            except Exception as cov_err:
-                                self.logger.error(f"Failed to calculate coverage for mass in {frame_key}: {cov_err}")
-
-                        # Also update instances for consistency
-                        if not hasattr(instances, 'root_subclass'):
-                            instances.root_subclass = [None] * len(instances)
-                            instances.root_confidence = [None] * len(instances)
-
-                        instances.root_subclass[det_idx] = result["class"]
-                        instances.root_confidence[det_idx] = result["confidence"]
-
-                        classified_count += 1
-
-                        self.logger.info(
-                            f"Frame {frame_key}: Root classified as {result['class']} "
-                            f"(conf: {result['confidence']:.3f})"
-                        )
-                except Exception as e:
-                    self.logger.error(f"Failed to classify root in {frame_key}: {e}")
-
-        self.logger.info(f"Classified {classified_count} root detections using full frames after filtering")
-
-    def _calculate_mass_coverage(self, frame, instances, det_idx, classes, frame_idx=None):
-        """Calculate angular and area coverage for mass root detection."""
-        try:
-            # Detect pipe rim
-            rim = self.rim_detector.detect(frame)
-            if rim is None:
-                self.logger.warning("Rim detection failed for mass coverage calculation")
-                return None
-            
-            # Get masks from instances
-            if not hasattr(instances, 'pred_masks') or len(instances.pred_masks) <= det_idx:
-                self.logger.warning("No mask available for mass detection")
-                return None
-            
-            # Get class names from metadata
-            class_names = self.metadata.thing_classes
-            
-            # Convert instance masks to class masks
-            h, w = frame.shape[:2]
-            class_masks = {cls: np.zeros((h, w), dtype=np.uint8) for cls in class_names}
-            
-            # Fill in the mask for this specific detection
-            mask = instances.pred_masks[det_idx].numpy().astype(np.uint8) * 255
-            class_id = int(classes[det_idx])
-            if class_id < len(class_names):
-                class_masks[class_names[class_id]] = mask
-            
-            # Analyze coverage
-            coverage = self.coverage_analyzer.analyze(frame, class_masks, rim)
-            
-            # Get the coverage for this specific class
-            class_name = class_names[class_id] if class_id < len(class_names) else None
-            if class_name and class_name in coverage.per_class:
-                angular_pct = coverage.per_class[class_name].angular_coverage.coverage_percentage
-                area_pct = coverage.per_class[class_name].angular_coverage.area_coverage_percentage
-                
-                self._visualize_mass_coverage(frame, coverage, rim, class_masks, angular_pct, area_pct, frame_idx, det_idx)
-                return {
-                    "angular_pct": float(angular_pct),
-                    "area_pct": float(area_pct)
-                }
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"Error in _calculate_mass_coverage: {e}")
-            return None
-    
-    def _visualize_mass_coverage(self, frame, coverage, rim, class_masks, 
-                                 angular_pct, area_pct, frame_idx, det_idx):
-        """Draw rim circle and coverage metrics on frame and save."""
-        try:
-            # Create visualization
-            vis = self.coverage_analyzer.visualize(frame, coverage, rim, class_masks, show_per_class=True)
-            
-            # Draw additional coverage info
-            cx, cy, r = int(rim.center_x), int(rim.center_y), int(rim.radius)
-            
-            # Draw rim circle in yellow
-            cv2.circle(vis, (cx, cy), r, (0, 255, 255), 3)
-            cv2.circle(vis, (cx, cy), 7, (0, 255, 255), -1)
-            
-            # Add large text at bottom showing both metrics
-            text_y = vis.shape[0] - 60
-            cv2.putText(vis, f"MASS COVERAGE", (10, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-            cv2.putText(vis, f"Angular: {angular_pct:.1f}%  |  Area: {area_pct:.1f}%", 
-                       (10, text_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            
-            # Save visualization
-            output_dir = "mass_coverage_output"
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, f"mass_coverage_frame_{frame_idx}_det_{det_idx}.jpg")
-            cv2.imwrite(output_path, vis)
-            self.logger.info(f"Saved mass coverage visualization: {output_path}")
-            
-        except Exception as e:
-            self.logger.error(f"Error visualizing mass coverage: {e}")
-
-    def _predict_batch(self, batch):
-        batch_inputs = self.preprocess(batch)
-        inference_start = time.time()
-        with torch.inference_mode():
-            outputs = self.model(batch_inputs)
-        self.timing_stats.inference_time += time.time() - inference_start
-        return outputs
-
-    def _predict_batch_default(self, batch):
-        """Run inference on batch using default predictor"""
-        inference_start = time.time()
-        predictions = [self.predictor(img) for img in batch]
-        self.timing_stats.inference_time += time.time() - inference_start
-        return predictions
-
-    def _visualize_batch(self, batch, outputs, timestamps, frames_dir):
-        """Visualize results from custom batch processing"""
-        vis_start = time.time()
-        Normal_frames = []
-        frames_with_detections = []
-        frame_count = 0
-        
-        pbar = tqdm(enumerate(zip(outputs, timestamps)), total=len(outputs), desc="Visualizing detections",colour="cyan")
-        for frame_idx, (output, timestamp) in pbar:
-            instances = output["instances"].to("cpu")
-            
-            if len(instances) > 0:
-                frame_count += 1
-                self._process_detections(instances, frame_count, timestamp)
-                
-                frame_to_save = batch[frame_idx] 
-                frame_to_save_with_predictions = self._draw_predictions(batch[frame_idx], instances)
-                               
-                Normal_frames.append({
-                    'frame': frame_to_save,
-                    'timestamp': timestamp,
-                    'frame_idx': frame_count
-                })
-                frames_with_detections.append({
-                    'frame': frame_to_save_with_predictions,
-                    'timestamp': timestamp,
-                    'frame_idx': frame_count
-                })
-
-        # Save frames with predictions
-        predictions_frames_dir = os.path.join(frames_dir, "predictions_frames")
-        os.makedirs(predictions_frames_dir, exist_ok=True)
-        self._save_detection_frames(predictions_frames_dir, frames_with_detections, _IsNormalFrame=False)
-        # Save normal frames
-        self._save_detection_frames(frames_dir, Normal_frames, _IsNormalFrame=True)
-
-        
-        self.timing_stats.visualization_time += time.time() - vis_start
-
-    def _process_detections(self, instances, frame_count, timestamp):
-        """Process detection instances for a frame"""
-        boxes = instances.pred_boxes.tensor.numpy()
-        scores = instances.scores.numpy()
-        classes = instances.pred_classes.numpy()
-        
-        root_subclasses = getattr(instances, 'root_subclass', [None] * len(instances))
-        root_confidences = getattr(instances, 'root_confidence', [None] * len(instances))
-        
-        detections = []
-        for idx, (box, score, class_id) in enumerate(zip(boxes, scores, classes)):
-            detection = {
-                "bbox": box.tolist(),
-                "class": self.metadata.thing_classes[class_id],
-                "confidence": float(score),
-                "frame_time": time.time(),
-                "timestamp_seconds": timestamp
-            }
-            
-            if self.metadata.thing_classes[class_id] == "Root" and root_subclasses[idx]:
-                detection["root_subclass"] = root_subclasses[idx]
-                detection["root_subclass_confidence"] = float(root_confidences[idx])
-            
-            detections.append(detection)
-            
-        self.all_detections[f"Image_{frame_count}"] = {"Detection": detections}
-
-    def _should_draw_predictions(self):
-        """Check if predictions should be drawn on frames"""
-        return False
-
-    def _draw_predictions(self, frame, instances):
-        """Draw prediction visualizations on frame"""
-        v = Visualizer(frame[:, :, ::-1], metadata=self.metadata, scale=1.0)
-        v = v.draw_instance_predictions(instances)
-        return v.get_image()[:, :, ::-1]
-
-    def _save_detection_frames(self, frames_dir, frames_with_detections, _IsNormalFrame):
-        """Save frames with detections to disk"""
-        # Clear existing frames
-        self._clear_existing_frames(frames_dir)
-        
-        # Save new frames
-        pbar = tqdm(frames_with_detections, desc="Saving detection frames", colour="cyan")
-        for frame_info in pbar:
-            timestamp_str = self._format_timestamp(frame_info['timestamp']).replace(':', '_')
-            frame_path = os.path.join(frames_dir, f"frame_{frame_info['frame_idx']}_{timestamp_str}.jpg")
-            
-            try:
-                cv2.imwrite(frame_path, frame_info['frame'])
-                self.logger.info(f"Saved detection frame: {frame_path}")
-                
-                # Update detection metadata with frame path if needed
-                if _IsNormalFrame:
-                    self._update_detection_metadata(frame_info['frame_idx'], frame_path)
-            except Exception as e:
-                self.logger.error(f"Error saving frame {frame_path}: {str(e)}")
-    
-    def _clear_existing_frames(self, frames_dir):
-        """Clear existing jpg frames from the directory"""
-        for file in os.listdir(frames_dir):
-            if file.endswith('.jpg'):
-                try:
-                    os.remove(os.path.join(frames_dir, file))
-                except Exception as e:
-                    self.logger.error(f"Error deleting file {file}: {str(e)}")
-    
-    def _update_detection_metadata(self, frame_idx, frame_path):
-        """Update detection metadata with frame path"""
-        image_key = f"Image_{frame_idx}"
-        if image_key in self.all_detections:
-            self.all_detections[image_key]["frame_path"] = frame_path
-
-    def _extract_and_process_text(self, frames):
-        """Extract and process text from frames with detections"""
-        self.logger.info("Starting text extraction from frames with detections...")
-        text_extraction_start = time.time()
-        
-
-        
-        
-        self.distance_base = 0
-        distance_means = []
-        prev_timestamp = 0
-        prev_distance = 0
-        
-        # Sort detections by timestamp
-        self.all_detections = dict(sorted(
-            self.all_detections.items(),
-            key=lambda item: item[1]["Detection"][0]["timestamp_seconds"]
-        ))
-        
-        pbar = tqdm(self.all_detections.items(), desc="Processing frame text", colour="cyan")
-        total_frames = len(self.all_detections)
-        
-        for i, (frame_key, frame_data) in enumerate(pbar):
-            result = self._process_frame_text(
-                frame_key, frame_data,
-                distance_means,
-                prev_timestamp, prev_distance
-            )
-            
-            # Update first_frame and prev values if needed
-
-            prev_timestamp = result.get('timestamp', prev_timestamp)
-            prev_distance = result.get('distance', prev_distance)
-            
-            # Update progress for text extraction stage
-            progress = ((i + 1) / total_frames) * 100
-            if i % 10 == 0:
-                self.progress_logger.update_stage_progress(
-                    "text extraction",
-                    progress,
-                    {"frames_processed": i + 1, "total_frames": total_frames}
-                )
-        self.progress_logger.complete_stage(
-            "text extraction",
-            {"status": "Text extraction complete"}
-        )
-
-        self.timing_stats.text_extraction_time = time.time() - text_extraction_start
-        self.logger.info(f"Text extraction completed. Time taken: {self.timing_stats.text_extraction_time:.2f}s")
-
-
-    def _process_frame_text(self, frame_key, frame_data,
-                           distance_means,
-                           prev_timestamp, prev_distance):
-        """Process text for a single frame"""
-        
-        self.logger.info(f"Extracting text from frame {frame_key}...")
-        result = {
-            'timestamp': prev_timestamp,
-            'distance': prev_distance
-        }
-        
-        try:
-            text_info = self.text_extractor.extract_text_from_video_frame(
-                frame_path=frame_data["frame_path"],
-                UseFullOCR=False
-            )
-
-            
-            current_distance, current_timestamp = self._extract_distance_and_timestamp(
-                text_info, frame_data, prev_distance
-            )
-            
-                
-            distance_means.append(current_distance)
-            mean_distance = mean(distance_means)
-            
-            distance_diff = abs(current_distance - self.distance_base)
-            time_diff = current_timestamp - prev_timestamp
-            
-            frame_data["text_info"] = self._update_distance(
-                current_distance, distance_diff,
-                time_diff, frame_data
-            )
-            
-            result['timestamp'] = current_timestamp
-            result['distance'] = float(frame_data["text_info"])
-            self.logger.info(f"Extracted final distance info: {text_info}, first distance: {current_distance}")
-            
-        except (ValueError, IndexError) as e:
-            self.logger.error(f"Error processing text in frame {frame_key}: {str(e)}")
-            frame_data["text_info"] = str(self.distance_base)
-            
-        return result
-
-    def _extract_distance_and_timestamp(self, text_info, frame_data, prev_distance):
-        """Extract distance and timestamp from text"""
-        
-        split_text = text_info.split(" ")
-        text = split_text[0]
-        
-        # Handle multiple decimals or missing decimal point
-        if len(text.split('.')) > 2 or \
-           (len(text) < len(str(prev_distance)) and '.' not in text):
-            text_info = self.text_extractor.extract_text_from_video_frame(
-                frame_path=frame_data["frame_path"],
-                UseFullOCR=True
-            )
-
-            text = text_info.split(" ")[0]
-            
-        return float(text), frame_data["Detection"][0]["timestamp_seconds"]
-
-    def _update_distance(self, current_distance, distance_diff,
-                        time_diff, frame_data):
-        """Update and validate distance measurement
-        
-        Args:
-            current_distance (float): The current distance measurement
-            distance_diff (float): Absolute difference from base distance
-            time_diff (float): Time elapsed since previous measurement
-            frame_data (dict): Frame metadata including path
-            
-        Returns:
-            str: Updated distance value as string
-        """
-        # Avoid global variable usage by accessing class attribute instead
-        
-        # Define validation thresholds for distance measurements
-        MAX_DISTANCE_DIFF = 2.0
-        MIN_DISTANCE_DIFF = 0.25
-        MAX_TIME_GAP = 20.0
-        
-        # Check if measurement is valid based on defined thresholds
-        is_valid_measurement = (
-            (current_distance >= self.distance_base or distance_diff < MIN_DISTANCE_DIFF) and
-            distance_diff <= MAX_DISTANCE_DIFF and 
-            time_diff < MAX_TIME_GAP
-        )
-        
-        if is_valid_measurement:
-            # Update base distance if current is greater
-            self.distance_base = max(self.distance_base, current_distance)
-            return str(self.distance_base)
-        
-        # If measurement is invalid, attempt to recover with full OCR
-        text_info = self.text_extractor.extract_text_from_video_frame(
-            frame_path=frame_data["frame_path"],
-            UseFullOCR=True
-        )
-        
-        try:
-            text = text_info.split(" ")[0]
-            new_distance = float(text)
-            self.distance_base = max(self.distance_base, new_distance)
-            return str(self.distance_base)
-        except (ValueError, IndexError):
-            # Return existing base distance if recovery fails
-            self.logger.debug(f"Failed to extract valid distance from '{text_info}'")
-            return str(self.distance_base)
-
-
-    def _save_results(self, output_path):
-        """Save detection results to JSON"""
-        base_name = os.path.basename(output_path).split("_")[0]
-        
-        json_output_path = os.path.join(output_path,  "frames_detections.json")
-        with open(json_output_path, 'w') as f:
-            json.dump(self.all_detections, f, indent=4)
-        self.logger.info(f"Detection data saved to {json_output_path}")
-
-    def _log_timing_stats(self, process_start):
-        """Log final timing statistics"""
-        self.timing_stats.total_time = time.time() - process_start
-        self.logger.info("\nTiming Statistics:")
-        self.logger.info(f"Frame Collection Time: {self.timing_stats.frame_collection_time:.2f}s")
-        self.logger.info(f"Preprocessing Time: {self.timing_stats.preprocessing_time:.2f}s")
-        self.logger.info(f"Inference Time: {self.timing_stats.inference_time:.2f}s")
-        self.logger.info(f"Visualization Time: {self.timing_stats.visualization_time:.2f}s")
-        self.logger.info(f"Text extraction Time: {self.timing_stats.text_extraction_time:.2f}s")
-        self.logger.info(f"Total Time: {self.timing_stats.total_time:.2f}s")
-
-
-    def _format_timestamp(self, seconds):
-        """Format seconds into HH:MM:SS string"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+	def __init__(self, config: DetectionConfig, text_extractor=None):
+		self._setup_logging()
+		self.cfg = self._initialize_config(config)
+		self._initialize_model(config)
+		self._setup_dataset(config.class_names, config.colors)
+		
+		self.timing_stats = TimingStats()
+		self.custom_batch = config.custom_batch
+		self.all_detections = {}
+		self.text_extractor = text_extractor
+		self._setup_progress_logger()
+		self._initialize_few_shot_classifier()
+
+	def _setup_progress_logger(self):
+		# Initialize progress logger
+		self.progress_logger = ProgressLogger()
+		# Initialize stages with their weights
+		self.stages = {
+			"initialization": 5,
+			"frame extraction": 10,
+			"Ai detection": 40,
+			"text extraction": 30,
+			"excel reporting": 15
+		}
+		self.progress_logger.start_process(self.stages)
+
+		# Update progress for initialization stage
+		self.progress_logger.update_stage_progress(
+			"initialization",
+			80.0,
+			{"status": "Setting up detector configuration"}
+		)
+	
+	def _initialize_few_shot_classifier(self):
+		"""Initialize root type classifier for few-shot detection."""
+		base_dir = os.path.dirname(os.path.abspath(__file__))
+		model_path = os.path.join(base_dir, "Model", "MiniModel", "Root", "model.pth")
+		support_set_dir = os.path.join(base_dir, "Model", "MiniModel", "Root", "Support_Set")
+		
+		try:
+			self.root_classifier = RootClassifier(
+				model_path=model_path,
+				support_set_dir=support_set_dir,
+				device=self.cfg.MODEL.DEVICE
+			)
+			self.logger.info("Root classifier initialized successfully")
+		except Exception as e:
+			self.logger.warning(f"Failed to initialize root classifier: {e}")
+			self.root_classifier = None
+
+	def _setup_logging(self):
+		"""Configure logging with detailed format"""
+		# Create logs directory if it doesn't exist
+		log_dir = "logs"
+		if not os.path.exists(log_dir):
+			os.makedirs(log_dir)
+			
+		log_file = os.path.join(log_dir, "defect_detection.log")
+		
+		# Configure root logger
+		logging.basicConfig(
+			level=logging.INFO,
+			format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+			handlers=[
+				logging.StreamHandler(sys.stdout),
+				logging.FileHandler(log_file, mode='a')
+			]
+		)
+		
+		# Create logger for this class
+		self.logger = logging.getLogger(__name__)
+		self.logger.setLevel(logging.INFO)
+		
+		# Add file handler with rotation
+		file_handler = logging.FileHandler(log_file)
+		file_handler.setFormatter(
+			logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+		)
+		self.logger.addHandler(file_handler)
+		
+		# Log startup message
+		self.logger.info("Initializing BatchDefectDetector")
+
+	def _initialize_model(self, config: DetectionConfig):
+		print("  Initializing Detectron2 model...")
+
+		# Build model and load weights into *this* model
+		self.model = build_model(self.cfg)
+		self.model.eval()
+		DetectionCheckpointer(self.model).load(self.cfg.MODEL.WEIGHTS)
+
+		# optional warmup (helps first-call latency)
+		with torch.inference_mode():
+			dummy = torch.zeros(3, self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST)
+			dummy_batch = [{
+				"image": dummy.to(self.cfg.MODEL.DEVICE),
+				"height": self.cfg.INPUT.MIN_SIZE_TEST,
+				"width": self.cfg.INPUT.MIN_SIZE_TEST,
+			}]
+			self.model(dummy_batch)
+
+		# keep predictor only if you want single-image path
+		self.predictor = DefaultPredictor(self.cfg)
+
+		self.aug = ResizeShortestEdge(
+			[self.cfg.INPUT.MIN_SIZE_TEST, self.cfg.INPUT.MIN_SIZE_TEST],
+			self.cfg.INPUT.MAX_SIZE_TEST
+		)
+		self.input_format = self.cfg.INPUT.FORMAT
+		assert self.input_format in ["RGB", "BGR"], self.input_format
+
+		print("  Detectron2 model initialized successfully")
+
+	def _setup_dataset(self, class_names: List[str], colors: List[List[int]]) -> None:
+		"""Setup custom dataset metadata"""
+		MetadataCatalog.get("custom_dataset").set(thing_classes=class_names)
+		self.metadata = MetadataCatalog.get("custom_dataset")
+		self.metadata.thing_colors = colors
+		
+		# Initialize pipe coverage analyzer now that we have class names
+		try:
+			self.rim_detector = PipeRimDetector(
+				edge_low=50,
+				edge_high=150,
+				min_radius=400,  # temporary default, will be updated from first frame
+				max_radius=900,  # temporary default, will be updated from first frame
+				ransac_iterations=5000,
+				ransac_threshold=5.0,
+				temporal_alpha=0.7,
+				use_hough=True,
+				blur_kernel=5,
+				confidence_threshold=1.0    # force refinement always
+			)
+			self.coverage_analyzer = MultiClassCoverageAnalyzer(
+				class_names,
+				theta_bins=360,
+				inner_radius_factor=0.85,
+				outer_radius_factor=0.98   # was 1.0; tighten to hug the wall
+			)
+			self.logger.info("Pipe coverage analyzer initialized successfully")
+		except Exception as e:
+			self.logger.warning(f"Failed to initialize coverage analyzer: {e}")
+			self.rim_detector = None
+			self.coverage_analyzer = None
+
+	def _initialize_config(self, config: DetectionConfig):
+		"""Initialize Detectron2 configuration"""
+		cfg = get_cfg()
+		cfg.merge_from_file(config.config_path)
+		cfg.MODEL.WEIGHTS = config.model_path
+		cfg.MODEL.DEVICE = config.device
+		cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = config.score_threshold
+		cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = config.nms_threshold
+		cfg.MODEL.ROI_HEADS.CLASS_NAMES = config.class_names
+		return cfg
+
+	def preprocess(self, images):
+		"""Preprocess batch of images for inference"""
+		preprocess_start = time.time()
+		batch_inputs = []
+		
+		for img in images:
+			if self.input_format == "RGB":
+				img = img[:, :, ::-1]  # Convert BGR → RGB
+			
+			height, width = img.shape[:2]
+			img_transformed = self.aug.get_transform(img).apply_image(img)
+			img_tensor = torch.as_tensor(img_transformed.astype("float32").transpose(2, 0, 1))
+			
+			batch_inputs.append({
+				"image": img_tensor.to(self.cfg.MODEL.DEVICE),
+				"height": height,
+				"width": width
+			})
+			
+		self.timing_stats.preprocessing_time += time.time() - preprocess_start
+		return batch_inputs
+
+	def reset_for_new_video(self):
+		"""Reset detector state for processing a new video"""
+		self.all_detections = {}
+		self.timing_stats = TimingStats()
+		self.distance_base = 0
+		self._setup_progress_logger()
+
+	def process_video(self, input_path: str, output_path: str, batch_size: int = 8):
+		self.progress_logger.complete_stage(
+			"initialization",
+			{"status": "Detector configuration setup complete"}
+		)
+
+		"""Process video file in batches for object detection"""
+		process_start = time.time()
+		
+		frames_to_process, timestamps_to_process = self._collect_frames(input_path)
+		
+		# Process frames in batches
+		all_predictions, all_frames, all_timestamps = self._process_batches(
+			frames_to_process,
+			timestamps_to_process,
+			batch_size
+		)
+
+		# Visualize and save results
+		frames_dir = os.path.join(output_path, "frames")
+		os.makedirs(frames_dir, exist_ok=True)
+		
+		if self.custom_batch:
+			self._visualize_batch(all_frames, all_predictions, all_timestamps, frames_dir)
+		else:
+			self._visualize_batch_default(all_frames, all_predictions, all_timestamps)
+
+		self._extract_and_process_text(all_frames)
+		self.modify_detection_baseExperience()
+
+		# Apply few-shot classification to root detections after filtering
+		self._classify_root_detections(all_frames, all_predictions)
+
+		self._save_results(output_path)
+		self._log_timing_stats(process_start)
+
+		return frames_to_process
+	
+	def modify_detection_baseExperience(self):
+
+		try:
+			"""Modify detection base experience"""
+			# Group detections by text_info (distance)
+			self.all_detectionsBaseCopy = self.all_detections.copy()
+			distance_groups = {}
+			for frame_key, frame_data in self.all_detections.items():
+				distance = frame_data["text_info"]
+				if distance not in distance_groups:
+					distance_groups[distance] = []
+				distance_groups[distance].append((frame_key, frame_data))
+
+			# Process detection groups based on detection count
+			filtered_groups = {}
+			
+			for distance, group in distance_groups.items():
+				# Check if all frames in this group have exactly 1 detection
+				all_single_detection = all(len(frame_data["Detection"]) == 1 for _, frame_data in group)
+				
+				if all_single_detection:
+					# If all frames have exactly 1 detection, keep the most repetitive class
+					class_counts = {}
+					for _, frame_data in group:
+						defect_class = frame_data["Detection"][0]["class"]
+						class_counts[defect_class] = class_counts.get(defect_class, 0) + 1
+					
+					# Find the most common class
+					most_common_class = max(class_counts.items(), key=lambda x: x[1])[0] if class_counts else None
+					
+					# Keep only frames with the most common class
+					if most_common_class:
+						filtered_frames = []
+						for frame_key, frame_data in group:
+							if frame_data["Detection"][0]["class"] == most_common_class:
+								filtered_frames.append((frame_key, frame_data))
+						
+						filtered_groups[distance] = filtered_frames
+						self.logger.info(f"Distance {distance}: Kept {len(filtered_frames)} frames with most common class '{most_common_class}'")
+				else:
+					# If some frames have multiple detections, keep only those with 2+ detections
+					multi_detection_frames = []
+					for frame_key, frame_data in group:
+						if len(frame_data["Detection"]) >= 2:
+							multi_detection_frames.append((frame_key, frame_data))
+					
+					if multi_detection_frames:
+						filtered_groups[distance] = multi_detection_frames
+						self.logger.info(f"Distance {distance}: Kept {len(multi_detection_frames)} frames with 2+ detections")
+			
+			
+			# First, filter out duplicate detections within each frame
+			for distance, group in filtered_groups.items():
+				for frame_idx, (frame_key, frame_data) in enumerate(group):
+					# Track unique classes we've seen in this frame
+					seen_classes = set()
+					unique_detections = []
+					
+					# Process each detection and keep only unique classes
+					for detection in frame_data["Detection"]:
+						defect_class = detection["class"]
+						if defect_class not in seen_classes:
+							seen_classes.add(defect_class)
+							unique_detections.append(detection)
+					
+					# Update the frame data with unique detections
+					frame_data["Detection"] = unique_detections
+					group[frame_idx] = (frame_key, frame_data)
+					
+				# Update the distance group with the modified frames
+				distance_groups[distance] = group
+				
+			# Now filter out duplicate frames that have identical class combinations
+			for distance, group in distance_groups.items():
+				# Track unique class combinations we've seen
+				unique_class_combinations = []
+				unique_frames = []
+				
+				for frame_key, frame_data in group:
+					# Get sorted list of classes in this frame
+					frame_classes = sorted([d["class"] for d in frame_data["Detection"]])
+					class_combination = tuple(frame_classes)
+					
+					# If we haven't seen this combination before, keep it
+					if class_combination not in unique_class_combinations:
+						unique_class_combinations.append(class_combination)
+						unique_frames.append((frame_key, frame_data))
+				
+				# Update the distance group with unique frames
+				distance_groups[distance] = unique_frames
+				
+			self.logger.info(f"Filtered detection groups to keep only unique class combinations")
+
+			# Filter out frames that are too close to each other (less than 0.15m apart)
+			self.logger.info("Filtering frames that are too close to each other (< 0.15m)")
+			
+			# Convert distance strings to floats and sort them
+			distances = sorted([(d) for d in distance_groups.keys()])
+			
+			# Create a new filtered dictionary to store the results
+			final_filtered_groups = {}
+			
+			# Process distances in order
+			i = 0
+			while i < len(distances):
+				current_distance = distances[i]
+				current_key = str(current_distance)
+				
+				# Add the first distance to our filtered results
+				if i == 0:
+					final_filtered_groups[current_key] = distance_groups[current_key]
+					i += 1
+					continue
+				
+				# Get the previous distance we kept
+				prev_distance = distances[i-1]
+				prev_key = str(prev_distance)
+				
+				# Check if current distance is too close to previous one
+				# Convert to float for numerical comparison
+				if float(current_distance) - float(prev_distance) < 0.15:
+					# Compare the number of detections
+					current_frames = distance_groups[current_key]
+					prev_frames = distance_groups[current_key]  # Use from final_filtered_groups instead
+					
+					# Count total detections in current distance group
+					current_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in current_frames)
+					
+					# Count total detections in previous distance group
+					prev_detection_count = sum(len(frame_data["Detection"]) for _, frame_data in prev_frames)
+					
+					if current_detection_count > prev_detection_count:
+						# Current has more detections, replace previous
+						if prev_key in final_filtered_groups:
+							del final_filtered_groups[prev_key]
+						final_filtered_groups[current_key] = current_frames
+					elif current_detection_count == prev_detection_count:
+						# Equal detection counts, compare confidence scores
+						current_max_confidence = max(
+							[detection.get("confidence", 0) for _, frame_data in current_frames 
+							for detection in frame_data["Detection"]], 
+							default=0
+						)
+						prev_max_confidence = max(
+							[detection.get("confidence", 0) for _, frame_data in prev_frames 
+							for detection in frame_data["Detection"]], 
+							default=0
+						)
+						
+						if current_max_confidence > prev_max_confidence:
+							# Current has higher confidence, replace previous
+							if prev_key in final_filtered_groups:
+								del final_filtered_groups[prev_key]
+							final_filtered_groups[current_key] = current_frames
+						# If previous has higher confidence, keep it (do nothing)
+				else:
+					# Distance is not too close, keep current frame
+					final_filtered_groups[current_key] = distance_groups[current_key]
+				
+				i += 1
+			
+			# Replace distance_groups with our filtered version
+			distance_groups = final_filtered_groups
+			
+			# Filter out similar detections across different distance groups using IoU
+			self.logger.info("Filtering similar detections across distance groups based on bounding box similarity")
+			
+			def _calculate_bbox_similarity(self, bbox1, bbox2):
+				"""Calculate IoU (Intersection over Union) between two bounding boxes"""
+				# Extract coordinates
+				x1_1, y1_1, x2_1, y2_1 = bbox1
+				x1_2, y1_2, x2_2, y2_2 = bbox2
+				
+				# Calculate intersection area
+				x_left = max(x1_1, x1_2)
+				y_top = max(y1_1, y1_2)
+				x_right = min(x2_1, x2_2)
+				y_bottom = min(y2_1, y2_2)
+				
+				# Check if there is an intersection
+				if x_right < x_left or y_bottom < y_top:
+					return 0.0
+					
+				intersection_area = (x_right - x_left) * (y_bottom - y_top)
+				
+				# Calculate union area
+				bbox1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+				bbox2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+				union_area = bbox1_area + bbox2_area - intersection_area
+				
+				# Calculate IoU
+				iou = intersection_area / union_area if union_area > 0 else 0.0
+				return iou
+			
+			# Convert method to function for use within this scope
+			calculate_bbox_similarity = lambda bbox1, bbox2: _calculate_bbox_similarity(self, bbox1, bbox2)
+			
+			# Group similar detections across distance groups
+			similarity_groups = []
+			processed_frames = set()
+			
+			# Sort distance groups by distance for consistent processing
+			sorted_distances = sorted(distance_groups.keys(), key=lambda x: float(x))
+			
+			for i, distance1 in enumerate(sorted_distances):
+				group1 = distance_groups[distance1]
+				
+				for frame1_key, frame1_data in group1:
+					if frame1_key in processed_frames:
+						continue
+					
+					# Create a new similarity group
+					current_group = [(frame1_key, frame1_data)]
+					processed_frames.add(frame1_key)
+					
+					# Compare with other distance groups
+					for j in range(i+1, len(sorted_distances)):
+						distance2 = sorted_distances[j]
+						group2 = distance_groups[distance2]
+						
+						for frame2_key, frame2_data in group2:
+							if frame2_key in processed_frames:
+								continue
+							
+							# Check if detections are similar using IoU
+							is_similar = False
+							
+							# Compare all detections between the two frames
+							for detection1 in frame1_data["Detection"]:
+								for detection2 in frame2_data["Detection"]:
+									# Skip if classes are different
+									if detection1["class"] != detection2["class"]:
+										continue
+										
+									# Calculate IoU between bounding boxes
+									iou = calculate_bbox_similarity(detection1["bbox"], detection2["bbox"])
+									
+									# If IoU is above threshold, consider them similar
+									if iou > 0.6:  # Threshold can be adjusted
+										is_similar = True
+										break
+								
+								if is_similar:
+									break
+							
+							# If similar, add to current group and mark as processed
+							if is_similar:
+								current_group.append((frame2_key, frame2_data))
+								processed_frames.add(frame2_key)
+					
+					# Add the group to similarity groups if it has at least one frame
+					if current_group:
+						similarity_groups.append(current_group)
+			
+			# For each similarity group, keep only the frame with highest confidence or most detections
+			optimized_groups = {}
+			
+			for group in similarity_groups:
+				if not group:
+					continue
+					
+				# Find the best frame in the group
+				best_frame_key = None
+				best_frame_data = None
+				max_detection_count = -1
+				max_confidence = -1
+				
+				for frame_key, frame_data in group:
+					# Count detections
+					detection_count = len(frame_data["Detection"])
+					
+					# Calculate average confidence
+					avg_confidence = sum(d.get("confidence", 0) for d in frame_data["Detection"]) / detection_count if detection_count > 0 else 0
+					
+					# Prioritize by detection count, then by confidence
+					if detection_count > max_detection_count or (detection_count == max_detection_count and avg_confidence > max_confidence):
+						max_detection_count = detection_count
+						max_confidence = avg_confidence
+						best_frame_key = frame_key
+						best_frame_data = frame_data
+				
+				# Add the best frame to optimized groups
+				if best_frame_key and best_frame_data:
+					distance = best_frame_data["text_info"]
+					if distance not in optimized_groups:
+						optimized_groups[distance] = []
+					optimized_groups[distance].append((best_frame_key, best_frame_data))
+			
+			# Replace distance_groups with optimized version
+			distance_groups = optimized_groups
+			
+			self.logger.info(f"After similarity filtering: kept {len(distance_groups)} distance groups with {sum(len(group) for group in distance_groups.values())} frames")
+			# Update all_detections with filtered results
+			self.all_detections = {}
+			for distance, frames in distance_groups.items():
+				for frame_key, frame_data in frames:
+					self.all_detections[frame_key] = frame_data
+			
+			self.logger.info(f"After proximity filtering: kept {len(distance_groups)} distance groups")
+
+		except Exception as e:
+			self.logger.error(f"Error modifying detection base experience: {str(e)}")
+		
+
+		# Remove any detections not in filtered groups and their associated frames
+		for key, frame_data in self.all_detectionsBaseCopy.items():
+			if key not in self.all_detections:
+
+				self.logger.info(f"Frame {key} was in original detections but removed in filtering")               # Remove associated frame image if it exists
+				if "frame_path" in frame_data:
+					try:
+						os.remove(frame_data["frame_path"])
+						base_dir = os.path.dirname(frame_data["frame_path"])
+						Predictions_dir = os.path.join(base_dir, "predictions_frames")
+						PredImageName = os.path.join(Predictions_dir, os.path.basename(frame_data["frame_path"]))
+						os.remove(PredImageName)
+						self.logger.info(f"Removed frame image: {frame_data['frame_path']}")
+					except Exception as e:
+						self.logger.error(f"Error removing frame image {frame_data['frame_path']}: {str(e)}")
+
+
+	def _collect_frames(self, input_path: str):
+		"""Collect frames from video file using FFmpeg with hardware acceleration"""
+
+		self.logger.info("Starting fast frame collection with FFmpeg...")
+		frame_collection_start = time.time()
+
+		# Get first frame for ROI selection (text extractor needs this)
+		cap = cv2.VideoCapture(input_path)
+		ret, first_frame = cap.read()
+		if ret:
+			self.text_extractor._get_user_roi(first_frame)
+
+			# Update rim detector radius bounds based on first frame
+			if self.rim_detector is not None:
+				h, w = first_frame.shape[:2]
+				Rmin = int(0.33 * min(h, w))
+				Rmax = int(0.48 * min(h, w))
+				self.rim_detector.update_radius_bounds(Rmin, Rmax)
+				self.logger.info(f"Updated rim detector bounds: min_radius={Rmin}, max_radius={Rmax}")
+		# cap.release()
+
+		if not cap.isOpened():
+			self.logger.error(f"Error opening video file {input_path}")
+			return [], []
+
+		# Use FFmpeg for fast frame extraction with downsampling
+		target_fps = 1  # Downsample to 1 FPS for efficiency
+
+		# Calculate target dimensions once (shared between FFmpeg and OpenCV)
+		w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+		h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+		#target_width, target_height = self._calculate_target_dimensions(w, h)
+		target_width, target_height = w, h
+		try:
+			frames_to_process, timestamps_to_process = self._collect_frames_ffmpeg(
+				input_path, target_fps=target_fps, width=target_width, height=target_height
+			)
+		except RuntimeError as e:
+			self.logger.warning(f"FFmpeg frame extraction failed: {e}")
+			self.logger.info("Falling back to OpenCV frame extraction...")
+			# Fallback to OpenCV method with same target dimensions
+			frames_to_process, timestamps_to_process = self._collect_frames_opencv(
+				input_path, target_width=target_width, target_height=target_height
+			)
+
+		self.timing_stats.frame_collection_time = time.time() - frame_collection_start
+		self.logger.info(f"FFmpeg frame collection complete. Total frames: {len(frames_to_process)}. "
+						f"Time taken: {self.timing_stats.frame_collection_time:.2f}s")
+
+		self.progress_logger.complete_stage(
+			"frame extraction",
+			{"status": "Frame collection complete"}
+		)
+
+		return frames_to_process, timestamps_to_process
+
+	def _collect_frames_ffmpeg(self, path, target_fps=1, width=None, height=None):
+		"""Fast frame collection using FFmpeg with hardware acceleration and downsampling"""
+		# Pick best hwaccel
+		def try_cmd(hw=None):
+			vf = [f"fps={target_fps}"]
+			if width and height:
+				# scale on GPU when possible; otherwise CPU scale is fine
+				if hw == "cuda":
+					vf.append(f"scale_cuda={width}:{height}")
+				else:
+					vf.append(f"scale={width}:{height}")
+			vf = ",".join(vf)
+
+			base = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+			if hw == "cuvid":
+				# Most reliable NVIDIA hwaccel
+				base += ["-hwaccel", "cuvid", "-c:v", "h264_cuvid"]
+			elif hw == "cuda":
+				# Alternative NVIDIA hwaccel
+				base += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+			elif hw == "d3d11va":
+				# Intel/AMD hwaccel
+				base += ["-hwaccel", "d3d11va"]
+			# hw == None uses CPU (no hwaccel flags)
+			base += ["-i", path, "-vf", vf, "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+			return base
+
+		# Figure out output size (use provided dimensions or get from video)
+		if width is None or height is None:
+			cap = cv2.VideoCapture(path)
+			w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if width is None else width
+			h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if height is None else height
+			cap.release()
+		else:
+			w, h = width, height
+
+		frame_bytes = w * h * 3
+
+		# Try hardware acceleration in order of reliability: cuvid > cuda > d3d11va > cpu
+		hw_options = []
+		if torch.cuda.is_available():
+			hw_options.extend(["cuvid", "cuda"])  # cuvid is more reliable than cuda
+		hw_options.extend(["d3d11va", None])  # d3d11va for Intel/AMD, None for CPU fallback
+
+		for hw in hw_options:
+			try:
+				self.logger.info(f"Trying FFmpeg with hwaccel: {hw or 'cpu'}")
+				p = subprocess.Popen(try_cmd(hw), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+				frames, ts = [], []
+				i = 0
+				read = p.stdout.read
+				while True:
+					buf = read(frame_bytes)
+					if not buf or len(buf) < frame_bytes:
+						break
+					frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+					frames.append(frame)
+					ts.append(i/float(target_fps))
+					i += 1
+				p.stdout.close()
+				p.wait()
+
+				if p.returncode == 0 and len(frames) > 0:
+					self.logger.info(f"Successfully collected {len(frames)} frames using {hw or 'cpu'} hwaccel")
+					return frames, ts
+				else:
+					# Get stderr for debugging
+					stderr_output = p.stderr.read().decode('utf-8', errors='ignore') if p.stderr else ""
+					self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed (exit code: {p.returncode})")
+					if stderr_output:
+						# Show first 300 chars of error
+						error_preview = stderr_output[:300] + "..." if len(stderr_output) > 300 else stderr_output
+						self.logger.warning(f"FFmpeg stderr: {error_preview}")
+					else:
+						self.logger.warning("No stderr output from FFmpeg")
+			except Exception as e:
+				self.logger.warning(f"FFmpeg with {hw or 'cpu'} failed: {e}")
+				continue  # try next hwaccel
+
+		raise RuntimeError("FFmpeg frame extraction failed with all hardware acceleration options.")
+
+	def _calculate_target_dimensions(self, original_width: int, original_height: int) -> tuple[int, int]:
+		"""Calculate target dimensions for frame processing with intelligent downscaling"""
+		# Downscale large videos for better performance (sewer videos don't need 1080p)
+		# Most sewer inspection videos are 720p or smaller, but handle 1080p gracefully
+		if original_height > 720:
+			target_height = 720
+			target_width = int(original_width * 720 / original_height)  # Maintain aspect ratio
+			self.logger.info(f"Downscaling from {original_width}x{original_height} to {target_width}x{target_height} for performance")
+		else:
+			target_width, target_height = original_width, original_height
+
+		return target_width, target_height
+
+	def _collect_frames_opencv(self, input_path: str, target_width: int = None, target_height: int = None):
+		"""Fallback frame collection using OpenCV (slower but reliable)"""
+		frames_to_process = []
+		timestamps_to_process = []
+
+		cap = cv2.VideoCapture(input_path)
+		if not cap.isOpened():
+			self.logger.error(f"Error opening video file {input_path}")
+			return [], []
+
+		# Get original dimensions
+		orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+		orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+		total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+		fps = int(cap.get(cv2.CAP_PROP_FPS))
+		frame_interval = fps  # Extract 1 frame per second
+
+		# Use provided target dimensions or calculate them
+		if target_width is None or target_height is None:
+			target_w, target_h = self._calculate_target_dimensions(orig_w, orig_h)
+		else:
+			target_w, target_h = target_width, target_height
+			self.logger.info(f"OpenCV fallback: Using provided dimensions {target_w}x{target_h}")
+
+		frame_idx = 0
+		pbar = tqdm(total=total_frames, desc="Reading frames (fallback)", colour="cyan")
+
+		while frame_idx < total_frames:
+			ret, frame = cap.read()
+			if not ret:
+				break
+
+			if frame_idx % frame_interval == 0:
+				# Resize frame to target dimensions if needed
+				current_shape = frame.shape[:2]  # (height, width)
+				if current_shape != (target_h, target_w):
+					frame = cv2.resize(frame, (target_w, target_h))
+
+				frames_to_process.append(frame)
+				timestamps_to_process.append(frame_idx / fps)
+
+			frame_idx += 1
+			pbar.update(1)
+
+			# Update progress for frame extraction stage
+			progress = (frame_idx / total_frames) * 100
+			if frame_idx % 800 == 0:
+				self.progress_logger.update_stage_progress(
+					"frame extraction",
+					progress,
+					{"frames_processed": frame_idx, "total_frames": total_frames}
+				)
+
+		pbar.close()
+		cap.release()
+
+		self.logger.info(f"OpenCV fallback collected {len(frames_to_process)} frames")
+		return frames_to_process, timestamps_to_process
+
+	def _process_batches(self, frames, timestamps, batch_size):
+		"""Process frames in batches"""
+		total_batches = math.ceil(len(frames) / batch_size)
+		self.logger.info(f"Starting batch processing of {len(frames)} frames in {total_batches} batches")
+		
+		all_predictions = []
+		all_frames = []
+		all_timestamps = []
+		batch_start_time = time.time()
+		total_batch_time = 0
+		
+		pbar = tqdm(range(0, len(frames), batch_size), desc="Processing batches",colour="cyan")
+		for i in pbar:
+			batch = frames[i:i + batch_size]
+			batch_timestamps = timestamps[i:i + batch_size]
+
+			current_batch = i // batch_size + 1
+			pbar.set_description(f"Processing batch {current_batch}/{total_batches}")
+			
+			# Run inference
+			if self.custom_batch:
+				outputs = self._predict_batch(batch)
+				all_predictions.extend(outputs)
+			else:
+				predictions = self._predict_batch_default(batch)
+				all_predictions.extend(predictions)
+			
+			all_frames.extend(batch)
+			all_timestamps.extend(batch_timestamps)
+			
+			# Log timing
+			batch_time = time.time() - batch_start_time
+			total_batch_time += batch_time
+			pbar.set_postfix({"Batch time": f"{batch_time:.2f}s", "Total time": f"{total_batch_time:.2f}s"})
+			batch_start_time = time.time()
+			
+			# Update progress for AI detection stage
+			progress = (current_batch / total_batches) * 100
+			if current_batch % 3 == 0:
+				self.progress_logger.update_stage_progress(
+					"Ai detection",
+					progress,
+				{
+					"batch": current_batch,
+					"total_batches": total_batches,
+					"batch_time": f"{batch_time:.2f}s",
+					"total_time": f"{total_batch_time:.2f}s"
+				}
+				)
+		
+		self.progress_logger.complete_stage(
+			"Ai detection",
+			{"status": "AI detection complete"}
+		)
+		return all_predictions, all_frames, all_timestamps
+	
+	def _classify_root_detections(self, frames, predictions):
+		"""Apply few-shot classification to Root detections after filtering using full frames.
+
+		Args:
+			frames: List of frame images
+			predictions: List of prediction outputs from model
+		"""
+		if self.root_classifier is None or not self.root_classifier.is_loaded():
+			self.logger.warning("Root classifier not available, skipping few-shot classification")
+			return
+
+		self.logger.info("Applying few-shot classification to remaining Root detections using full frames...")
+		root_class_idx = self.metadata.thing_classes.index("Root")
+		classified_count = 0
+
+		# Only process frames that remain after filtering
+		for frame_key, frame_data in self.all_detections.items():
+			if "Detection" not in frame_data:
+				continue
+
+			# Extract frame index from key (e.g., "Image_1" -> 0)
+			frame_idx = int(frame_key.split("_")[1]) - 1
+
+			if frame_idx >= len(frames) or frame_idx >= len(predictions):
+				continue
+
+			frame = frames[frame_idx]
+			output = predictions[frame_idx]
+
+			if not self.custom_batch:
+				instances = output["instances"]
+			else:
+				instances = output["instances"]
+
+			instances = instances.to("cpu")
+
+			if len(instances) == 0:
+				continue
+
+			boxes = instances.pred_boxes.tensor.numpy()
+			classes = instances.pred_classes.numpy()
+
+			# Get Root detections in this frame
+			root_detections = [(i, box) for i, (box, class_id) in enumerate(zip(boxes, classes))
+							 if class_id == root_class_idx]
+
+			for det_idx, box in root_detections:
+				# Use full frame for root classification instead of cropping
+				# Save full frame image temporarily
+				temp_dir = "temp_crops"
+				os.makedirs(temp_dir, exist_ok=True)
+				temp_filename = os.path.join(temp_dir, f"full_frame_{frame_idx}_det_{det_idx}.jpg")
+				cv2.imwrite(temp_filename, frame)
+
+				try:
+					result = self.root_classifier.predict(frame)
+
+					# Update the stored detection with subclass info
+					# Find the correct detection index within frame_data["Detection"] where 'class' == "Root"
+					# This ensures we update the right detection entry for the det_idx-th Root detection
+					
+					for idx, detection in enumerate(frame_data["Detection"]):
+						try:
+							if detection.get('class') == "Root":
+								detection["root_subclass"] = result["class"]
+								detection["root_subclass_confidence"] = float(result["confidence"])
+							
+								# If classified as "mass", calculate pipe coverage
+								if result["class"].lower() == "mass" and self.rim_detector and self.coverage_analyzer:
+							
+										coverage_info = self._calculate_mass_coverage(
+											frame, instances, 0, classes, frame_idx
+										)
+										if coverage_info:
+											frame_data["Detection"][idx]["angular_coverage_pct"] = coverage_info["angular_pct"]
+											frame_data["Detection"][idx]["area_coverage_pct"] = coverage_info["area_pct"]
+											self.logger.info(
+												f"Frame {frame_key}: Mass coverage - Angular: {coverage_info['angular_pct']:.1f}%, "
+												f"Area: {coverage_info['area_pct']:.1f}%"
+										)
+						except Exception as cov_err:
+							self.logger.error(f"Failed to calculate coverage for mass in {frame_key}: {cov_err}")
+
+					# Also update instances for consistency
+					if not hasattr(instances, 'root_subclass'):
+						instances.root_subclass = [None] * len(instances)
+						instances.root_confidence = [None] * len(instances)
+
+					instances.root_subclass[det_idx] = result["class"]
+					instances.root_confidence[det_idx] = result["confidence"]
+
+					classified_count += 1
+
+					self.logger.info(
+						f"Frame {frame_key}: Root classified as {result['class']} "
+						f"(conf: {result['confidence']:.3f})"
+					)
+				except Exception as e:
+					self.logger.error(f"Failed to classify root in {frame_key}: {e}")
+
+		self.logger.info(f"Classified {classified_count} root detections using full frames after filtering")
+
+	def _calculate_mass_coverage(self, frame, instances, det_idx, classes, frame_idx=None):
+		"""Calculate angular and area coverage for mass root detection."""
+		try:
+			# Detect pipe rim
+			rim = self.rim_detector.detect(frame)
+			if rim is None:
+				self.logger.warning("Rim detection failed for mass coverage calculation")
+				return None
+			
+			# Get masks from instances
+			if not hasattr(instances, 'pred_masks'):
+				self.logger.warning("No mask available for mass detection")
+				return None
+			
+			# Get class names from metadata
+			class_names = self.metadata.thing_classes
+			
+			# Convert instance masks to class masks
+			h, w = frame.shape[:2]
+			class_masks = {cls: np.zeros((h, w), dtype=np.uint8) for cls in class_names}
+			
+			# Fill in the mask for this specific detection
+			mask = instances.pred_masks[det_idx].numpy().astype(np.uint8) * 255
+			class_id = int(classes[det_idx])
+			if class_id < len(class_names):
+				class_masks[class_names[class_id]] = mask
+			
+			# Analyze coverage
+			coverage = self.coverage_analyzer.analyze(frame, class_masks, rim)
+			
+			# Get the coverage for this specific class
+			class_name = class_names[class_id] if class_id < len(class_names) else None
+			if class_name and class_name in coverage.per_class:
+				angular_pct = coverage.per_class[class_name].angular_coverage.coverage_percentage
+				area_pct = coverage.per_class[class_name].angular_coverage.area_coverage_percentage
+				
+				self._visualize_mass_coverage(frame, coverage, rim, class_masks, angular_pct, area_pct, frame_idx, det_idx)
+				return {
+					"angular_pct": float(angular_pct),
+					"area_pct": float(area_pct)
+				}
+			
+			return None
+			
+		except Exception as e:
+			self.logger.error(f"Error in _calculate_mass_coverage: {e}")
+			return None
+	
+	def _visualize_mass_coverage(self, frame, coverage, rim, class_masks, 
+								 angular_pct, area_pct, frame_idx, det_idx):
+		"""Draw rim circle and coverage metrics on frame and save."""
+		try:
+			# Create visualization
+			vis = self.coverage_analyzer.visualize(frame, coverage, rim, class_masks, show_per_class=True)
+			
+			# Draw additional coverage info
+			cx, cy, r = int(rim.center_x), int(rim.center_y), int(rim.radius)
+			
+			# Draw rim circle in yellow
+			cv2.circle(vis, (cx, cy), r, (0, 255, 255), 3)
+			cv2.circle(vis, (cx, cy), 7, (0, 255, 255), -1)
+			
+			# Add large text at bottom showing both metrics
+			text_y = vis.shape[0] - 60
+			cv2.putText(vis, f"MASS COVERAGE", (10, text_y), 
+					   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+			cv2.putText(vis, f"Angular: {angular_pct:.1f}%  |  Area: {area_pct:.1f}%", 
+					   (10, text_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+			
+			# Save visualization
+			output_dir = "mass_coverage_output"
+			os.makedirs(output_dir, exist_ok=True)
+			output_path = os.path.join(output_dir, f"mass_coverage_frame_{frame_idx}_det_{det_idx}.jpg")
+			cv2.imwrite(output_path, vis)
+			self.logger.info(f"Saved mass coverage visualization: {output_path}")
+			
+		except Exception as e:
+			self.logger.error(f"Error visualizing mass coverage: {e}")
+
+	def _predict_batch(self, batch):
+		batch_inputs = self.preprocess(batch)
+		inference_start = time.time()
+		with torch.inference_mode():
+			outputs = self.model(batch_inputs)
+		self.timing_stats.inference_time += time.time() - inference_start
+		return outputs
+
+	def _predict_batch_default(self, batch):
+		"""Run inference on batch using default predictor"""
+		inference_start = time.time()
+		predictions = [self.predictor(img) for img in batch]
+		self.timing_stats.inference_time += time.time() - inference_start
+		return predictions
+
+	def _visualize_batch(self, batch, outputs, timestamps, frames_dir):
+		"""Visualize results from custom batch processing"""
+		vis_start = time.time()
+		Normal_frames = []
+		frames_with_detections = []
+		frame_count = 0
+		
+		pbar = tqdm(enumerate(zip(outputs, timestamps)), total=len(outputs), desc="Visualizing detections",colour="cyan")
+		for frame_idx, (output, timestamp) in pbar:
+			instances = output["instances"].to("cpu")
+			
+			if len(instances) > 0:
+				frame_count += 1
+				self._process_detections(instances, frame_count, timestamp)
+				
+				frame_to_save = batch[frame_idx] 
+				frame_to_save_with_predictions = self._draw_predictions(batch[frame_idx], instances)
+							   
+				Normal_frames.append({
+					'frame': frame_to_save,
+					'timestamp': timestamp,
+					'frame_idx': frame_count
+				})
+				frames_with_detections.append({
+					'frame': frame_to_save_with_predictions,
+					'timestamp': timestamp,
+					'frame_idx': frame_count
+				})
+
+		# Save frames with predictions
+		predictions_frames_dir = os.path.join(frames_dir, "predictions_frames")
+		os.makedirs(predictions_frames_dir, exist_ok=True)
+		self._save_detection_frames(predictions_frames_dir, frames_with_detections, _IsNormalFrame=False)
+		# Save normal frames
+		self._save_detection_frames(frames_dir, Normal_frames, _IsNormalFrame=True)
+
+		
+		self.timing_stats.visualization_time += time.time() - vis_start
+
+	def _calculate_clock_positions(self, bbox, frame_shape):
+		"""Calculate clock positions (start and end) for a bounding box.
+		
+		Args:
+			bbox: Bounding box coordinates [x1, y1, x2, y2]
+			frame_shape: Frame dimensions (height, width)
+			
+		Returns:
+			Tuple of (start_clock, end_clock) as integers (1-12)
+		"""
+		h, w = frame_shape[:2]
+		cx, cy = w / 2, h / 2
+		
+		x1, y1, x2, y2 = bbox
+		# Get bbox center and corners
+		bbox_cx = (x1 + x2) / 2
+		bbox_cy = (y1 + y2) / 2
+		
+		# Calculate angles for all four corners and center
+		points = [
+			(x1, y1),  # top-left
+			(x2, y1),  # top-right
+			(x2, y2),  # bottom-right
+			(x1, y2),  # bottom-left
+			(bbox_cx, bbox_cy)  # center
+		]
+		
+		angles = []
+		for px, py in points:
+			dx = px - cx
+			dy = py - cy
+			angle = np.arctan2(-dy, dx)  # negative dy because y increases downward
+			# Convert to degrees and adjust so 12 o'clock is 0
+			angle_deg = (np.degrees(angle) + 90) % 360
+			angles.append(angle_deg)
+		
+		# Convert angles to clock positions (1-12)
+		min_angle = min(angles)
+		max_angle = max(angles)
+		
+		# Handle wrap-around (e.g., defect spans from 11 to 1 o'clock)
+		if max_angle - min_angle > 180:
+			# Wrap around case
+			angles = [(a + 180) % 360 for a in angles]
+			min_angle = min(angles)
+			max_angle = max(angles)
+		
+		# Convert to clock positions (30 degrees per hour)
+		start_clock = int((min_angle / 30) % 12)
+		end_clock = int((max_angle / 30) % 12)
+		
+		# Adjust to 1-12 range (12 instead of 0)
+		start_clock = 12 if start_clock == 0 else start_clock
+		end_clock = 12 if end_clock == 0 else end_clock
+
+		# Format as "HH:00" (e.g., "04:00")
+		start_clock_str = f"{start_clock:02d}:00"
+		end_clock_str = f"{end_clock:02d}:00"
+		
+		return start_clock_str, end_clock_str
+
+	def _process_detections(self, instances, frame_count, timestamp):
+		"""Process detection instances for a frame"""
+		boxes = instances.pred_boxes.tensor.numpy()
+		scores = instances.scores.numpy()
+		classes = instances.pred_classes.numpy()
+		
+		root_subclasses = getattr(instances, 'root_subclass', [None] * len(instances))
+		root_confidences = getattr(instances, 'root_confidence', [None] * len(instances))
+		
+		# Get frame shape from first detection or use stored value
+		frame_shape = getattr(self, '_current_frame_shape', (1080, 1920))
+		
+		detections = []
+		for idx, (box, score, class_id) in enumerate(zip(boxes, scores, classes)):
+			# Calculate clock positions
+			start_clock, end_clock = self._calculate_clock_positions(box, frame_shape)
+			
+			detection = {
+				"bbox": box.tolist(),
+				"class": self.metadata.thing_classes[class_id],
+				"confidence": float(score),
+				"frame_time": time.time(),
+				"timestamp_seconds": timestamp,
+				"clock_start": start_clock,
+				"clock_end": end_clock
+			}
+			
+			if self.metadata.thing_classes[class_id] == "Root" and root_subclasses[idx]:
+				detection["root_subclass"] = root_subclasses[idx]
+				detection["root_subclass_confidence"] = float(root_confidences[idx])
+			
+			detections.append(detection)
+			
+		self.all_detections[f"Image_{frame_count}"] = {"Detection": detections}
+
+	def _should_draw_predictions(self):
+		"""Check if predictions should be drawn on frames"""
+		return False
+
+	def _draw_predictions(self, frame, instances):
+		"""Draw prediction visualizations on frame"""
+		v = Visualizer(frame[:, :, ::-1], metadata=self.metadata, scale=1.0)
+		v = v.draw_instance_predictions(instances)
+		return v.get_image()[:, :, ::-1]
+
+	def _save_detection_frames(self, frames_dir, frames_with_detections, _IsNormalFrame):
+		"""Save frames with detections to disk"""
+		# Clear existing frames
+		self._clear_existing_frames(frames_dir)
+		
+		# Save new frames
+		pbar = tqdm(frames_with_detections, desc="Saving detection frames", colour="cyan")
+		for frame_info in pbar:
+			timestamp_str = self._format_timestamp(frame_info['timestamp']).replace(':', '_')
+			frame_path = os.path.join(frames_dir, f"frame_{frame_info['frame_idx']}_{timestamp_str}.jpg")
+			
+			try:
+				cv2.imwrite(frame_path, frame_info['frame'])
+				self.logger.info(f"Saved detection frame: {frame_path}")
+				
+				# Update detection metadata with frame path if needed
+				if _IsNormalFrame:
+					self._update_detection_metadata(frame_info['frame_idx'], frame_path)
+			except Exception as e:
+				self.logger.error(f"Error saving frame {frame_path}: {str(e)}")
+	
+	def _clear_existing_frames(self, frames_dir):
+		"""Clear existing jpg frames from the directory"""
+		for file in os.listdir(frames_dir):
+			if file.endswith('.jpg'):
+				try:
+					os.remove(os.path.join(frames_dir, file))
+				except Exception as e:
+					self.logger.error(f"Error deleting file {file}: {str(e)}")
+	
+	def _update_detection_metadata(self, frame_idx, frame_path):
+		"""Update detection metadata with frame path"""
+		image_key = f"Image_{frame_idx}"
+		if image_key in self.all_detections:
+			self.all_detections[image_key]["frame_path"] = frame_path
+
+	def _extract_and_process_text(self, frames):
+		"""Extract and process text from frames with detections"""
+		self.logger.info("Starting text extraction from frames with detections...")
+		text_extraction_start = time.time()
+		
+
+		
+		
+		self.distance_base = 0
+		distance_means = []
+		prev_timestamp = 0
+		prev_distance = 0
+		
+		# Sort detections by timestamp
+		self.all_detections = dict(sorted(
+			self.all_detections.items(),
+			key=lambda item: item[1]["Detection"][0]["timestamp_seconds"]
+		))
+		
+		pbar = tqdm(self.all_detections.items(), desc="Processing frame text", colour="cyan")
+		total_frames = len(self.all_detections)
+		
+		for i, (frame_key, frame_data) in enumerate(pbar):
+			result = self._process_frame_text(
+				frame_key, frame_data,
+				distance_means,
+				prev_timestamp, prev_distance
+			)
+			
+			# Update first_frame and prev values if needed
+
+			prev_timestamp = result.get('timestamp', prev_timestamp)
+			prev_distance = result.get('distance', prev_distance)
+			
+			# Update progress for text extraction stage
+			progress = ((i + 1) / total_frames) * 100
+			if i % 10 == 0:
+				self.progress_logger.update_stage_progress(
+					"text extraction",
+					progress,
+					{"frames_processed": i + 1, "total_frames": total_frames}
+				)
+		self.progress_logger.complete_stage(
+			"text extraction",
+			{"status": "Text extraction complete"}
+		)
+
+		self.timing_stats.text_extraction_time = time.time() - text_extraction_start
+		self.logger.info(f"Text extraction completed. Time taken: {self.timing_stats.text_extraction_time:.2f}s")
+
+
+	def _process_frame_text(self, frame_key, frame_data,
+						   distance_means,
+						   prev_timestamp, prev_distance):
+		"""Process text for a single frame"""
+		
+		self.logger.info(f"Extracting text from frame {frame_key}...")
+		result = {
+			'timestamp': prev_timestamp,
+			'distance': prev_distance
+		}
+		
+		try:
+			text_info = self.text_extractor.extract_text_from_video_frame(
+				frame_path=frame_data["frame_path"],
+				UseFullOCR=False
+			)
+
+			
+			current_distance, current_timestamp = self._extract_distance_and_timestamp(
+				text_info, frame_data, prev_distance
+			)
+			
+				
+			distance_means.append(current_distance)
+			mean_distance = mean(distance_means)
+			
+			distance_diff = abs(current_distance - self.distance_base)
+			time_diff = current_timestamp - prev_timestamp
+			
+			frame_data["text_info"] = self._update_distance(
+				current_distance, distance_diff,
+				time_diff, frame_data
+			)
+			
+			result['timestamp'] = current_timestamp
+			result['distance'] = float(frame_data["text_info"])
+			self.logger.info(f"Extracted final distance info: {text_info}, first distance: {current_distance}")
+			
+		except (ValueError, IndexError) as e:
+			self.logger.error(f"Error processing text in frame {frame_key}: {str(e)}")
+			frame_data["text_info"] = str(self.distance_base)
+			
+		return result
+
+	def _extract_distance_and_timestamp(self, text_info, frame_data, prev_distance):
+		"""Extract distance and timestamp from text"""
+		
+		split_text = text_info.split(" ")
+		text = split_text[0]
+		
+		# Handle multiple decimals or missing decimal point
+		if len(text.split('.')) > 2 or \
+		   (len(text) < len(str(prev_distance)) and '.' not in text):
+			text_info = self.text_extractor.extract_text_from_video_frame(
+				frame_path=frame_data["frame_path"],
+				UseFullOCR=True
+			)
+
+			text = text_info.split(" ")[0]
+			
+		return float(text), frame_data["Detection"][0]["timestamp_seconds"]
+
+	def _update_distance(self, current_distance, distance_diff,
+						time_diff, frame_data):
+		"""Update and validate distance measurement
+		
+		Args:
+			current_distance (float): The current distance measurement
+			distance_diff (float): Absolute difference from base distance
+			time_diff (float): Time elapsed since previous measurement
+			frame_data (dict): Frame metadata including path
+			
+		Returns:
+			str: Updated distance value as string
+		"""
+		# Avoid global variable usage by accessing class attribute instead
+		
+		# Define validation thresholds for distance measurements
+		MAX_DISTANCE_DIFF = 2.0
+		MIN_DISTANCE_DIFF = 0.25
+		MAX_TIME_GAP = 20.0
+		
+		# Check if measurement is valid based on defined thresholds
+		is_valid_measurement = (
+			(current_distance >= self.distance_base or distance_diff < MIN_DISTANCE_DIFF) and
+			distance_diff <= MAX_DISTANCE_DIFF and 
+			time_diff < MAX_TIME_GAP
+		)
+		
+		if is_valid_measurement:
+			# Update base distance if current is greater
+			self.distance_base = max(self.distance_base, current_distance)
+			return str(self.distance_base)
+		
+		# If measurement is invalid, attempt to recover with full OCR
+		text_info = self.text_extractor.extract_text_from_video_frame(
+			frame_path=frame_data["frame_path"],
+			UseFullOCR=True
+		)
+		
+		try:
+			text = text_info.split(" ")[0]
+			new_distance = float(text)
+			self.distance_base = max(self.distance_base, new_distance)
+			return str(self.distance_base)
+		except (ValueError, IndexError):
+			# Return existing base distance if recovery fails
+			self.logger.debug(f"Failed to extract valid distance from '{text_info}'")
+			return str(self.distance_base)
+
+
+	def _save_results(self, output_path):
+		"""Save detection results to JSON"""
+		base_name = os.path.basename(output_path).split("_")[0]
+		
+		json_output_path = os.path.join(output_path,  "frames_detections.json")
+		with open(json_output_path, 'w') as f:
+			json.dump(self.all_detections, f, indent=4)
+		self.logger.info(f"Detection data saved to {json_output_path}")
+
+	def _log_timing_stats(self, process_start):
+		"""Log final timing statistics"""
+		self.timing_stats.total_time = time.time() - process_start
+		self.logger.info("\nTiming Statistics:")
+		self.logger.info(f"Frame Collection Time: {self.timing_stats.frame_collection_time:.2f}s")
+		self.logger.info(f"Preprocessing Time: {self.timing_stats.preprocessing_time:.2f}s")
+		self.logger.info(f"Inference Time: {self.timing_stats.inference_time:.2f}s")
+		self.logger.info(f"Visualization Time: {self.timing_stats.visualization_time:.2f}s")
+		self.logger.info(f"Text extraction Time: {self.timing_stats.text_extraction_time:.2f}s")
+		self.logger.info(f"Total Time: {self.timing_stats.total_time:.2f}s")
+
+
+	def _format_timestamp(self, seconds):
+		"""Format seconds into HH:MM:SS string"""
+		hours = int(seconds // 3600)
+		minutes = int((seconds % 3600) // 60)
+		seconds = int(seconds % 60)
+		return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def main():
-    try:
-        sys.argv = ["analyser_batch.py", r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"]
-        if len(sys.argv) < 2:
-            print("Usage: python YourPythonScript.py <video_path1> <video_path2> ...")
-            return
+	try:
+		sys.argv = ["analyser_batch.py", r"C:\Users\sobha\Desktop\detectron2\Data\TestFilm\Closed circuit television (CCTV) sewer inspection.mp4"]
+		if len(sys.argv) < 2:
+			print("Usage: python YourPythonScript.py <video_path1> <video_path2> ...")
+			return
 
-        input_pathes = sys.argv[1:]
-        print(input_pathes)
-    
-        # Get the directory where the current script is located
-        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+		input_pathes = sys.argv[1:]
+		print(input_pathes)
+	
+		# Get the directory where the current script is located
+		BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-        # Build the path to 'model/v2'
-        model_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'model_final.pth')
-        config_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'mask_rcnn_X_101_32x8d_FPN_3x.yaml')
-        
-        config = DetectionConfig(
-            class_names=[
-                "Crack", "Obstacle", "Deposits", "Deformed",
-                "Broken", "Joint Displaced", "Surface Damage", "Root"
-            ],
-            colors=[
-                [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
-                [255, 0, 255], [0, 255, 255], [128, 128, 128], [128, 0, 128]
-            ],
-            model_path=model_path,
-            config_path=config_path,
-            batch_size=4
-        )
-        
-        # Load all models once with optimizations
-        print("Loading TextExtractor models (EasyOCR + GOT-OCR) with async loading and caching...")
-        text_extractor = TextExtractor(lazy_load=True, use_cache=True)  # Use async loading and caching for better UX
-        print("Loading detection model...")
-        detector = BatchDefectDetector(config, text_extractor)
+		# Build the path to 'model/v2'
+		model_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'model_final.pth')
+		config_path = os.path.join(BASE_DIR, 'Model', 'Model V.2.8.0', 'mask_rcnn_X_101_32x8d_FPN_3x.yaml')
+		
+		config = DetectionConfig(
+			class_names=[
+				"Crack", "Obstacle", "Deposits", "Deformed",
+				"Broken", "Joint Displaced", "Surface Damage", "Root"
+			],
+			colors=[
+				[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+				[255, 0, 255], [0, 255, 255], [128, 128, 128], [128, 0, 128]
+			],
+			model_path=model_path,
+			config_path=config_path,
+			batch_size=4
+		)
+		
+		# Load all models once with optimizations
+		print("Loading TextExtractor models (EasyOCR + GOT-OCR) with async loading and caching...")
+		text_extractor = TextExtractor(lazy_load=True, use_cache=True)  # Use async loading and caching for better UX
+		print("Loading detection model...")
+		detector = BatchDefectDetector(config, text_extractor)
 
-        print(f"Model cache size: {TextExtractor.get_cache_size()} instances")
+		print(f"Model cache size: {TextExtractor.get_cache_size()} instances")
 
-        # Process all videos with pre-loaded models
-        for input_path in input_pathes:
-            if not os.path.isfile(input_path):
-                print(f"Invalid video path provided: {input_path}")
-                continue
-            
-            output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
-            os.makedirs(output_path, exist_ok=True)
+		# Process all videos with pre-loaded models
+		for input_path in input_pathes:
+			if not os.path.isfile(input_path):
+				print(f"Invalid video path provided: {input_path}")
+				continue
+			
+			output_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + "_output")
+			os.makedirs(output_path, exist_ok=True)
 
-            detector.logger.info(f"Processing video: {input_path}")
-            detector.reset_for_new_video()
-            detector.process_video(input_path, output_path, batch_size=config.batch_size)
-            
-            reporter = ExcelReporter(
-                input_path = output_path,
-                excelOutPutName = "Condition-Details.xlsx",
-                progress_logger = detector.progress_logger
-            )
-            reporter.generate_report()
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        time.sleep(15)
-        return
+			detector.logger.info(f"Processing video: {input_path}")
+			detector.reset_for_new_video()
+			detector.process_video(input_path, output_path, batch_size=config.batch_size)
+			
+			reporter = ExcelReporter(
+				input_path = output_path,
+				excelOutPutName = "Condition-Details.xlsx",
+				progress_logger = detector.progress_logger
+			)
+			reporter.generate_report()
+	except Exception as e:
+		print(f"An error occurred: {str(e)}")
+		time.sleep(15)
+		return
 
 if __name__ == "__main__":
-    main()
+	main()
